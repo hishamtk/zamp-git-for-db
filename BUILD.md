@@ -593,6 +593,8 @@ quickstart, deployed URL, video at the top, honest availability note.
 
 ## 3. Known traps
 
+0. **`CREATE OR REPLACE VIEW` cannot rename or drop columns** — `42P16: cannot change name of view column`. Since renaming and dropping is most of what a branch edit does, every view write must `DROP VIEW IF EXISTS` then plain `CREATE VIEW`. *(Hit during implementation; `createViewSQL()` emits the plain form deliberately.)*
+0b. **Bound parameters make `generate_series` ambiguous** — `42725: could not choose a best candidate function`, because the driver sends untyped parameters. Cast explicitly: `generate_series(${lo}::bigint, ${hi}::bigint)`. Applies to any overloaded function you parameterise.
 1. **`ALTER COLUMN TYPE` fails while any view references the column.** Task 14 exists for this.
 2. **`CREATE INDEX CONCURRENTLY` can't be transactional** and leaves invalid indexes on failure. Task 16.
 3. **Backfill doubles table size** (4 GB → 8.5 GB measured). `VACUUM` between batch groups; surface bloat.
