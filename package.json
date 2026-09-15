@@ -1,0 +1,14 @@
+{
+  "name": "gitdb",
+  "private": true,
+  "type": "module",
+  "workspaces": ["api", "web"],
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "dev": "npm run dev --workspace=api & npm run dev --workspace=web",
+    "build": "npm run build --workspace=api && npm run build --workspace=web",
+    "test": "npm run test --workspace=api",
+    "seed": "node infra/seed.mjs",
+    "typecheck": "tsc -b api web"
+  }
+}

@@ -1,0 +1,72 @@
+name: gitdb
+
+services:
+  db:
+    image: postgres:17
+    shm_size: 1g
+    environment:
+      POSTGRES_PASSWORD: gitdb
+      POSTGRES_USER: gitdb
+      POSTGRES_DB: gitdb
+    command:
+      - postgres
+      - -c
+      - shared_buffers=2GB
+      - -c
+      - max_wal_size=8GB
+      - -c
+      - work_mem=64MB
+      - -c
+      - maintenance_work_mem=1GB
+      - -c
+      - max_connections=100
+      # log any lock wait over 200ms - the telemetry story depends on seeing these
+      - -c
+      - log_lock_waits=on
+      - -c
+      - deadlock_timeout=200ms
+    ports:
+      - "55432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gitdb -d gitdb"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  api:
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+    environment:
+      DATABASE_URL: postgres://gitdb:gitdb@db:5432/gitdb
+      PORT: "8080"
+      NODE_ENV: production
+    ports:
+      - "8080:8080"
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: always
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://localhost:8080/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  web:
+    build:
+      context: .
+      dockerfile: web/Dockerfile
+    environment:
+      API_ORIGIN: http://api:8080
+    ports:
+      - "5173:80"
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: always
+
+volumes:
+  pgdata:
