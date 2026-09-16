@@ -91,6 +91,24 @@ export function canonicalType(typname: string, mods?: string | null, isArray = f
 }
 
 /**
+ * Canonicalise a type string that may be SQL spelling (`character varying(255)`),
+ * internal (`varchar(255)`), or already canonical (`pg_catalog.varchar(255)`).
+ *
+ * The diff engine uses this so two IRs that disagree only in spelling produce no op.
+ * Introspection already emits the canonical form; this is belt-and-braces for
+ * hand-built fixtures and parser output that skipped the catalog.
+ */
+export function canonicalizeTypeString(t: string): string {
+  const raw = t.trim();
+  const isArray = raw.endsWith("[]");
+  const core = (isArray ? raw.slice(0, -2) : raw).trim().replace(/^pg_catalog\./i, "");
+  const m = /^(.*?)(\([^)]*\))$/.exec(core);
+  const base = (m ? m[1]! : core).trim();
+  const mods = m ? m[2]! : null;
+  return canonicalType(base, mods, isArray);
+}
+
+/**
  * Canonicalise catalog output.
  *
  * `typname` comes from `pg_type.typname` (already internal). `formatted` is

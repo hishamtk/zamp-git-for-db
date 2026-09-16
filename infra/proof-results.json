@@ -1,0 +1,27 @@
+{
+  "measuredAt": "2026-09-16T04:21:25.016Z",
+  "rows": 20000,
+  "clients": 20,
+  "seconds": 16,
+  "readerHoldMs": 6000,
+  "naiveAlterMs": 5646,
+  "guarded": {
+    "ms": 5652,
+    "attempts": 6,
+    "acquired": true
+  },
+  "naiveLatency": {
+    "n": 19578,
+    "p50": 2.348,
+    "p95": 5.131,
+    "p99": 6.35,
+    "max": 5643.902
+  },
+  "guardedLatency": {
+    "n": 24547,
+    "p50": 2.869,
+    "p95": 5.066,
+    "p99": 7.032,
+    "max": 504.648
+  }
+}

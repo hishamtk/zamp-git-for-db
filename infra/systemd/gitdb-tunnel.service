@@ -1,0 +1,18 @@
+[Unit]
+Description=gitdb named tunnel
+After=network-online.target gitdb.service
+Wants=network-online.target
+Requires=gitdb.service
+
+[Service]
+Type=simple
+# Replace this ExecStart with a named Cloudflare tunnel or Tailscale Funnel.
+# Quick tunnels rotate their hostname and are not acceptable for submission.
+#   cloudflared tunnel run gitdb
+#   tailscale funnel --bg 5173
+ExecStart=/bin/false
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

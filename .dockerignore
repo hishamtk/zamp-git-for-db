@@ -1,0 +1,14 @@
+node_modules
+**/node_modules
+**/dist
+**/.vite
+**/*.tsbuildinfo
+.git
+.env
+.env.*
+coverage
+web/dist
+api/dist
+sources
+*.md
+!README.md

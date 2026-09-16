@@ -12,6 +12,7 @@ export type Branch = {
   head_commit: string | null;
   base_commit: string | null;
   stale_reason: string | null;
+  working_ir: SchemaIR | null;
   created_at: Date;
 };
 
@@ -26,11 +27,15 @@ export class BranchError extends Error {
 }
 
 export async function listBranches(sql: Sql): Promise<Branch[]> {
-  return sql<Branch[]>`SELECT * FROM gitdb.branches ORDER BY (name = ${MAIN_BRANCH}) DESC, created_at`;
+  return sql<Branch[]>`
+    SELECT name, schema_name, head_commit, base_commit, stale_reason, working_ir, created_at
+      FROM gitdb.branches ORDER BY (name = ${MAIN_BRANCH}) DESC, created_at`;
 }
 
 export async function getBranch(sql: Sql, name: string): Promise<Branch | null> {
-  const [b] = await sql<Branch[]>`SELECT * FROM gitdb.branches WHERE name = ${name}`;
+  const [b] = await sql<Branch[]>`
+    SELECT name, schema_name, head_commit, base_commit, stale_reason, working_ir, created_at
+      FROM gitdb.branches WHERE name = ${name}`;
   return b ?? null;
 }
 
@@ -48,6 +53,7 @@ export async function requireBranch(sql: Sql, name: string): Promise<Branch> {
  */
 export async function workingIR(sql: Sql, branch: string): Promise<SchemaIR> {
   const b = await requireBranch(sql, branch);
+  if (branch !== MAIN_BRANCH && b.working_ir) return SchemaIRSchema.parse(b.working_ir);
   const { ir } = await introspect(sql, b.schema_name);
   return ir;
 }
@@ -94,8 +100,11 @@ export async function createBranch(
       await tx.unsafe(stmt);
     }
     await tx`
-      INSERT INTO gitdb.branches (name, schema_name, head_commit, base_commit)
-      VALUES (${opts.name}, ${schema}, ${parent.head_commit}, ${parent.head_commit})`;
+      INSERT INTO gitdb.branches (name, schema_name, head_commit, base_commit, working_ir)
+      VALUES (
+        ${opts.name}, ${schema}, ${parent.head_commit}, ${parent.head_commit},
+        ${sql.json(parentIR as never)}
+      )`;
   });
 
   return requireBranch(sql, opts.name);
@@ -151,6 +160,10 @@ export async function applyIR(sql: Sql, branch: string, nextIR: SchemaIR): Promi
         await tx.unsafe(createTableSQL(b.schema_name, t));
       }
     }
+    await tx`
+      UPDATE gitdb.branches
+         SET working_ir = ${sql.json(ir as never)}, stale_reason = NULL
+       WHERE name = ${branch}`;
   });
 }
 
@@ -167,7 +180,7 @@ export async function regenerateBranch(sql: Sql, name: string): Promise<{ stale:
 
   const parent = await requireBranch(sql, MAIN_BRANCH);
   const parentIR = (await requireCommit(sql, parent.head_commit!)).ir;
-  const branchIR = b.head_commit ? (await requireCommit(sql, b.head_commit)).ir : parentIR;
+  const branchIR = await workingIR(sql, name);
 
   try {
     await sql.begin(async (tx) => {

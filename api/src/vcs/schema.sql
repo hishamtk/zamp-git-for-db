@@ -22,8 +22,13 @@ CREATE TABLE IF NOT EXISTS gitdb.branches (
   base_commit  text        REFERENCES gitdb.commits(id),
   -- Set when main drops something this branch's views still reference.
   stale_reason text,
+  -- Views carry columns only. Keep the full working tree so declared constraints
+  -- and indexes survive catalog re-reads until they are enforced at merge.
+  working_ir   jsonb,
   created_at   timestamptz NOT NULL DEFAULT now()
 );
+
+ALTER TABLE gitdb.branches ADD COLUMN IF NOT EXISTS working_ir jsonb;
 
 CREATE TABLE IF NOT EXISTS gitdb.merges (
   id            bigserial PRIMARY KEY,
@@ -73,3 +78,10 @@ CREATE TABLE IF NOT EXISTS gitdb.events (
 
 CREATE INDEX IF NOT EXISTS events_merge_idx  ON gitdb.events(merge_id, id);
 CREATE INDEX IF NOT EXISTS commits_branch_idx ON gitdb.commits(branch, created_at DESC);
+
+-- Pinned demo snapshot. Reset must restore this commit, never the oldest root.
+-- Commit 0 on this volume predates later seed tables (cards/disputes/merchants).
+CREATE TABLE IF NOT EXISTS gitdb.demo_seed (
+  id         int PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+  commit_id  text NOT NULL REFERENCES gitdb.commits(id)
+);
