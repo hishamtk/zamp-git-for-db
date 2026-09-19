@@ -87,6 +87,14 @@ export function findColumn(table: Table, name: string): Column | undefined {
 }
 
 /**
+ * Physical display / projection order. The IR itself is name-sorted so diffs
+ * ignore column reshuffles; views and the data browser still follow `ordinal`.
+ */
+export function columnsInPhysicalOrder(table: Table): Column[] {
+  return [...table.columns].sort((a, b) => a.ordinal - b.ordinal || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+}
+
+/**
  * Sort every collection by name. Applied after introspection and after any IR
  * mutation, so the canonical form is reachable from an arbitrarily ordered input.
  */

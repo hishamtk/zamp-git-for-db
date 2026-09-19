@@ -143,7 +143,7 @@ async function getMerge(id: number): Promise<Record<string, unknown>> {
       FROM gitdb.merges WHERE id = ${id}`;
   if (!merge) throw Object.assign(new Error(`no such merge: ${id}`), { statusCode: 404 });
   const steps = await sql`
-    SELECT seq, kind, state, rows_done, rows_total, cursor, lock_attempts, ms, error
+    SELECT seq, kind, sql, state, rows_done, rows_total, cursor, lock_attempts, ms, error
       FROM gitdb.merge_steps WHERE merge_id = ${id} ORDER BY seq`;
   return { ...merge, id, steps };
 }

@@ -1,5 +1,5 @@
 import type { SchemaOp } from "@gitdb/api/diff/diff";
-import type { SchemaIR } from "@gitdb/api/ir/types";
+import type { Constraint, Index, SchemaIR, Table } from "@gitdb/api/ir/types";
 
 export type Risk = "SAFE" | "LOCKING" | "REWRITE";
 export type Branch = {
@@ -30,6 +30,14 @@ export type MergePreview = {
   ops: SchemaOp[];
   plan: MigrationStep[];
   resultIR: SchemaIR;
+};
+export type IntegrateResult = {
+  source: string;
+  target: string;
+  ops: SchemaOp[];
+  resultIR: SchemaIR;
+  commit: string | null;
+  base: string;
 };
 export type ValidateReport = {
   branch: string;
@@ -101,12 +109,22 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ message }),
     }),
-  diff: (branch: string) =>
-    request<DiffResponse>(`/api/diff?from=main&to=${encodeURIComponent(branch)}`),
+  diff: (from: string, to: string) =>
+    request<DiffResponse>(`/api/diff?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`),
   previewMerge: (branch: string) =>
     request<MergePreview>("/api/merges", {
       method: "POST",
       body: JSON.stringify({ source: branch, target: "main" }),
+    }),
+  previewIntegrate: (source: string, target: string) =>
+    request<IntegrateResult>(`/api/branches/${encodeURIComponent(target)}/integrate`, {
+      method: "POST",
+      body: JSON.stringify({ source, preview: true }),
+    }),
+  integrate: (source: string, target: string) =>
+    request<IntegrateResult>(`/api/branches/${encodeURIComponent(target)}/integrate`, {
+      method: "POST",
+      body: JSON.stringify({ source }),
     }),
   merge: (id: number) => request<MergeDetail>(`/api/merges/${id}`),
   applyMerge: (id: number) =>
@@ -126,4 +144,4 @@ export const api = {
     request<void>(`/api/branches/${encodeURIComponent(name)}`, { method: "DELETE" }),
 };
 
-export type { SchemaIR, SchemaOp };
+export type { Constraint, Index, SchemaIR, SchemaOp, Table };

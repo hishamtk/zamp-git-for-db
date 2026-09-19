@@ -3,18 +3,20 @@ import { z } from "zod";
 import type { SchemaOp } from "../diff/diff.js";
 import { sql } from "../db.js";
 import { hashIR } from "../ir/canonical.js";
-import { findTable } from "../ir/types.js";
+import { columnsInPhysicalOrder, findTable } from "../ir/types.js";
 import { applySchemaOps, parseDDL } from "../ir/parse.js";
-import { assertBranchName, qname } from "../ident.js";
+import { assertBranchName, MAIN_BRANCH, qid, qname } from "../ident.js";
 import {
   applyIR,
   createBranch,
   deleteBranch,
+  isDirty,
   listBranches,
   requireBranch,
   workingIR,
 } from "../vcs/branches.js";
-import { log, writeCommit } from "../vcs/commits.js";
+import { log, lowestCommonAncestor, requireCommit, writeCommit } from "../vcs/commits.js";
+import { merge } from "../vcs/merge.js";
 
 const branchBody = z.object({
   name: z.string(),
@@ -25,6 +27,10 @@ const ddlBody = z.union([
   z.object({ ops: z.array(z.object({ kind: z.string() }).passthrough()).min(1), sql: z.never().optional() }),
 ]);
 const commitBody = z.object({ message: z.string().trim().min(1).max(500) });
+const integrateBody = z.object({
+  source: z.string().min(1),
+  preview: z.boolean().optional().default(false),
+});
 
 function branchParam(request: { params: unknown }): string {
   const name = z.object({ name: z.string() }).parse(request.params).name;
@@ -92,7 +98,8 @@ export async function branchRoutes(app: FastifyInstance): Promise<void> {
     }).parse(request.query);
     const b = await requireBranch(sql, branch);
     const ir = await workingIR(sql, branch);
-    if (!findTable(ir, table)) {
+    const tableIR = findTable(ir, table);
+    if (!tableIR) {
       throw Object.assign(new Error(`no such table on branch '${branch}': ${table}`), {
         statusCode: 404,
         code: "no_such_table",
@@ -101,11 +108,13 @@ export async function branchRoutes(app: FastifyInstance): Promise<void> {
 
     // Relation names come from the introspected IR and are quoted at interpolation.
     // The transaction is explicitly read-only so this browser can never mutate data.
+    // Project by physical ordinal so a name-sorted branch view matches main.
+    const projection = columnsInPhysicalOrder(tableIR).map((column) => qid(column.name)).join(", ");
     return sql.begin(async (tx) => {
       await tx`SET TRANSACTION READ ONLY`;
       const relation = qname(b.schema_name, table);
       const [rows, count] = await Promise.all([
-        tx.unsafe(`SELECT * FROM ${relation} LIMIT $1`, [limit]),
+        tx.unsafe(`SELECT ${projection} FROM ${relation} LIMIT $1`, [limit]),
         tx.unsafe(`SELECT count(*)::text AS count FROM ${relation}`),
       ]);
       return { rows, rowCount: Number(count[0]?.count ?? 0), limit };
@@ -135,5 +144,60 @@ export async function branchRoutes(app: FastifyInstance): Promise<void> {
     const branch = branchParam(request);
     await requireBranch(sql, branch);
     return log(sql, branch);
+  });
+
+  app.post("/api/branches/:name/integrate", async (request, reply) => {
+    const target = branchParam(request);
+    const body = integrateBody.parse(request.body);
+    const source = body.source;
+    assertBranchName(source);
+    if (target === MAIN_BRANCH || source === MAIN_BRANCH) {
+      throw Object.assign(new Error("integrate is branch-to-branch only; main is the production merge target"), {
+        statusCode: 400,
+        code: "invalid_target",
+      });
+    }
+    if (source === target) {
+      throw Object.assign(new Error("source and target must be different branches"), {
+        statusCode: 400,
+        code: "invalid_source",
+      });
+    }
+    const sourceBranch = await requireBranch(sql, source);
+    const targetBranch = await requireBranch(sql, target);
+    if (await isDirty(sql, source) || await isDirty(sql, target)) {
+      throw Object.assign(new Error("dirty"), {
+        statusCode: 409,
+        payload: { state: "dirty" },
+      });
+    }
+    if (!sourceBranch.head_commit || !targetBranch.head_commit) {
+      throw Object.assign(new Error("branch commit metadata is incomplete"), {
+        statusCode: 500,
+        code: "no_head",
+      });
+    }
+
+    const [base, ours, theirs] = await Promise.all([
+      lowestCommonAncestor(sql, sourceBranch.head_commit, targetBranch.head_commit),
+      requireCommit(sql, targetBranch.head_commit),
+      requireCommit(sql, sourceBranch.head_commit),
+    ]);
+    const result = merge(base.ir, ours.ir, theirs.ir);
+    if (result.conflicts) {
+      return reply.code(409).send({ state: "conflict", conflicts: result.conflicts });
+    }
+    const resultIR = applySchemaOps(ours.ir, result.ops);
+    if (body.preview) {
+      return { source, target, ops: result.ops, resultIR, commit: null, base: base.id };
+    }
+    await applyIR(sql, target, resultIR);
+    const commit = await writeCommit(sql, {
+      branch: target,
+      ir: resultIR,
+      message: `merge ${source}`,
+      parentId: targetBranch.head_commit,
+    });
+    return { source, target, ops: result.ops, resultIR, commit: commit.id, base: base.id };
   });
 }

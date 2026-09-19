@@ -8,12 +8,16 @@ import {
   Code2,
   Database,
   GitBranch,
+  Hash,
+  Key,
+  Link2,
   Loader2,
   Play,
   Plus,
   RefreshCw,
   Rocket,
   ShieldAlert,
+  ShieldCheck,
   Table2,
   Trash2,
   XCircle,
@@ -24,13 +28,17 @@ import {
   api,
   type Branch,
   type DiffResponse,
+  type IntegrateResult,
   type MergeDetail,
   type MergePreview,
   type MigrationStep,
   type Risk,
   type RiskOp,
+  type Constraint,
+  type Index,
   type SchemaIR,
   type SchemaOp,
+  type Table,
   type ValidateReport,
 } from "./api";
 import { Badge, Button, Card } from "./components/ui";
@@ -40,13 +48,10 @@ type Screen = "review" | "data" | "editor" | "diff" | "live";
 type Stats = { rowCount: number; sizeBytes: number; exact: boolean };
 type Telemetry = Record<string, unknown>;
 
-const EXAMPLE_DDL = `-- Write ordinary PostgreSQL DDL.
--- Branch views update instantly; no data is copied.
+const EXAMPLE_DDL = `-- Sample type change on accounts (~200k rows).
+-- Do not ALTER txns here — that backfills 25 million rows.
 ALTER TABLE accounts
-  ADD COLUMN billing_tier text DEFAULT 'standard';
-
-CREATE INDEX accounts_country_idx
-  ON accounts (country);`;
+  ALTER COLUMN name TYPE varchar(200);`;
 
 const navItems: Array<{ id: Screen; label: string; icon: typeof Database }> = [
   { id: "review", label: "Merge review", icon: Rocket },
@@ -101,6 +106,38 @@ function opDetail(op: SchemaOp): string {
   }
 }
 
+const constraintKindClasses: Record<Constraint["kind"], string> = {
+  primary: "border-amber-400/25 bg-amber-400/10 text-amber-300",
+  unique: "border-violet-400/25 bg-violet-400/10 text-violet-300",
+  check: "border-emerald-400/25 bg-emerald-400/10 text-emerald-300",
+  foreign: "border-sky-400/25 bg-sky-400/10 text-sky-300",
+};
+
+function constraintKindLabel(kind: Constraint["kind"]): string {
+  if (kind === "primary") return "PRIMARY KEY";
+  if (kind === "unique") return "UNIQUE";
+  if (kind === "check") return "CHECK";
+  return "FOREIGN KEY";
+}
+
+function constraintKindShort(kind: Constraint["kind"]): string {
+  if (kind === "primary") return "pk";
+  if (kind === "foreign") return "fk";
+  return kind;
+}
+
+function constraintDetail(constraint: Constraint): string {
+  if (constraint.kind === "check") return constraint.expression ?? "";
+  if (constraint.kind === "foreign" && constraint.references) {
+    return `(${constraint.columns.join(", ")}) → ${constraint.references.table}(${constraint.references.columns.join(", ")})`;
+  }
+  return constraint.columns.join(", ");
+}
+
+function shortType(type: string): string {
+  return type.replace(/^pg_catalog\./, "");
+}
+
 function estimatedStep(step: MigrationStep, rowCount: number): string {
   if (step.kind === "backfill") return `≈ ${Math.max(1, Math.ceil(rowCount / 136_000))}s`;
   if (step.kind === "index_concurrent") return "≈ 7s";
@@ -147,6 +184,8 @@ export default function App() {
   const [screen, setScreen] = useState<Screen>("review");
   const [schema, setSchema] = useState<SchemaIR | null>(null);
   const [diff, setDiff] = useState<DiffResponse | null>(null);
+  const [mainDiff, setMainDiff] = useState<DiffResponse | null>(null);
+  const [compareFrom, setCompareFrom] = useState("main");
   const [preview, setPreview] = useState<MergePreview | null>(null);
   const [merge, setMerge] = useState<MergeDetail | null>(null);
   const [telemetry, setTelemetry] = useState<Telemetry[]>([]);
@@ -167,8 +206,6 @@ export default function App() {
     const [{ ir }, nextStats] = await Promise.all([api.schema(branch), api.stats(branch)]);
     setSchema(ir);
     setStats((current) => ({ ...current, [branch]: nextStats }));
-    if (branch !== "main") setDiff(await api.diff(branch));
-    else setDiff(null);
   }, []);
 
   useEffect(() => {
@@ -187,21 +224,43 @@ export default function App() {
   }, [refreshBranch, refreshBranches]);
 
   useEffect(() => {
-    if (!merge?.id || screen !== "live" || !["planned", "running"].includes(merge.state)) return;
+    if (!merge?.id || screen !== "live") return;
+    const id = merge.id;
     const protocol = location.protocol === "https:" ? "wss:" : "ws:";
-    const socket = new WebSocket(`${protocol}//${location.host}/api/merges/${merge.id}/events`);
+    const socket = new WebSocket(`${protocol}//${location.host}/api/merges/${id}/events`);
     socket.onmessage = (message) => {
       const parsed = JSON.parse(message.data) as Telemetry;
       const event = (parsed.payload as Telemetry | undefined) ?? parsed;
       setTelemetry((current) => [...current, event]);
-      void api.merge(merge.id).then(setMerge);
+      void api.merge(id).then(setMerge);
     };
     socket.onerror = () => setError("The telemetry stream disconnected. Merge state can still be refreshed.");
-    return () => socket.close();
-  }, [merge?.id, merge?.state, screen]);
+    const poll = window.setInterval(() => {
+      void api.merge(id).then((next) => {
+        setMerge(next);
+        if (!["planned", "running"].includes(next.state)) window.clearInterval(poll);
+      }).catch((cause) => setError(messageOf(cause)));
+    }, 1000);
+    return () => {
+      socket.close();
+      window.clearInterval(poll);
+    };
+  }, [merge?.id, screen]);
+
+  useEffect(() => {
+    if (selected === "main") {
+      setDiff(null);
+      setMainDiff(null);
+      return;
+    }
+    const from = compareFrom === selected ? "main" : compareFrom;
+    void api.diff(from, selected).then(setDiff).catch((cause) => setError(messageOf(cause)));
+    void api.diff("main", selected).then(setMainDiff).catch((cause) => setError(messageOf(cause)));
+  }, [selected, compareFrom]);
 
   const chooseBranch = async (name: string) => {
     setSelected(name);
+    setCompareFrom("main");
     setPreview(null);
     setMerge(null);
     setConflicts(null);
@@ -211,6 +270,26 @@ export default function App() {
 
   const firstRun = !loading && branches.every((branch) => branch.name === "main");
   const selectedStats = stats[selected] ?? { rowCount: 0, sizeBytes: 0, exact: false };
+  const changeBranches = branches.filter((branch) => branch.name !== "main").map((branch) => branch.name);
+  const compareAgainst = ["main", ...changeBranches.filter((name) => name !== selected)];
+  const integrateTargets = changeBranches.filter((name) => name !== selected);
+
+  const integrateInto = async (target: string, previewOnly: boolean) => {
+    if (selected === "main") return null;
+    setBusy(previewOnly ? "integrate-preview" : "integrate");
+    setError("");
+    setConflicts(null);
+    try {
+      return previewOnly ? await api.previewIntegrate(selected, target) : await api.integrate(selected, target);
+    } catch (cause) {
+      if (cause instanceof ApiError && cause.body.state === "conflict") {
+        setConflicts((cause.body.conflicts as unknown[]) ?? []);
+        return null;
+      }
+      setError(messageOf(cause));
+      return null;
+    } finally { setBusy(""); }
+  };
 
   const createBranch = async (name: string) => {
     setBusy("create");
@@ -220,8 +299,10 @@ export default function App() {
       await refreshBranches();
       await chooseBranch(name);
       setScreen("editor");
-    } catch (cause) { setError(messageOf(cause)); }
-    finally { setBusy(""); }
+    } catch (cause) {
+      setError(messageOf(cause));
+      throw cause;
+    } finally { setBusy(""); }
   };
 
   const loadPreview = async () => {
@@ -257,6 +338,7 @@ export default function App() {
 
   const applyMerge = async () => {
     if (!preview) return;
+    setTelemetry([]);
     setMerge({ ...preview, steps: preview.plan.map((step) => ({ ...step, state: "pending", rows_done: 0, rows_total: null, lock_attempts: 0, ms: null })) });
     setScreen("live");
     setBusy("apply");
@@ -293,7 +375,7 @@ export default function App() {
         <aside className="border-r border-border bg-[#0d1014] p-4">
           <div className="mb-3 flex items-center justify-between px-2">
             <span className="text-xs font-semibold uppercase tracking-[.16em] text-muted">Branches</span>
-            <NewBranchButton onCreate={createBranch} busy={busy === "create"} />
+            <NewBranchButton onCreate={(name) => void createBranch(name).catch(() => undefined)} busy={busy === "create"} />
           </div>
           <div className="space-y-1">
             {branches.map((branch) => (
@@ -347,28 +429,43 @@ export default function App() {
             {error && <FailureBanner message={error} onClose={() => setError("")} />}
             {loading ? (
               <StatePanel kind="progress" title="Reading database state">Loading branches, catalog IR, and row estimates.</StatePanel>
-            ) : firstRun ? (
-              <FirstRun onCreate={createBranch} busy={busy === "create"} />
-            ) : selected === "main" && screen !== "data" ? (
+            ) : firstRun && screen !== "data" && screen !== "editor" ? (
+              <FirstRun onCreate={(name) => void createBranch(name).catch(() => undefined)} busy={busy === "create"} onBrowse={() => setScreen("data")} />
+            ) : selected === "main" && screen !== "data" && screen !== "editor" ? (
               <StatePanel kind="empty" title="Select a change branch">Main is the protected merge target. Choose a branch to review, diff, or edit.</StatePanel>
             ) : screen === "review" ? (
               <MergeReview
                 branch={selected}
-                diff={diff}
+                diff={mainDiff}
                 preview={preview}
                 conflicts={conflicts}
                 stats={selectedStats}
                 busy={busy}
+                integrateTargets={integrateTargets}
                 onPreview={loadPreview}
                 onApply={applyMerge}
+                onIntegrate={integrateInto}
+                onIntegrated={(target) => void chooseBranch(target)}
                 onEdit={() => setScreen("editor")}
               />
             ) : screen === "diff" ? (
-              <DiffView branch={selected} diff={diff} />
+              <DiffView
+                from={compareFrom === selected ? "main" : compareFrom}
+                to={selected}
+                diff={diff}
+                compareAgainst={compareAgainst}
+                onFromChange={setCompareFrom}
+              />
             ) : screen === "data" ? (
               <DataBrowser branch={selected} schema={schema} />
             ) : screen === "editor" ? (
-              <Editor branch={selected} onChanged={async () => { await refreshBranch(selected); setPreview(null); }} onReview={() => setScreen("review")} />
+              <Editor
+                branch={selected}
+                creating={busy === "create"}
+                onCreate={createBranch}
+                onChanged={async (name = selected) => { await refreshBranch(name); setPreview(null); }}
+                onReview={() => setScreen("review")}
+              />
             ) : (
               <LiveMerge
                 merge={merge}
@@ -392,61 +489,123 @@ function NewBranchButton({ onCreate, busy }: { onCreate: (name: string) => void;
   return (
     <div className="absolute left-4 top-20 z-20 w-72 rounded-xl border border-border bg-panel p-4 shadow-2xl">
       <label className="text-xs font-medium">New branch from main</label>
-      <input autoFocus value={name} onChange={(event) => setName(event.target.value.toLowerCase())} placeholder="billing-v2" className="mt-3 h-10 w-full rounded-md border border-border bg-background px-3 font-mono text-sm outline-none focus:border-accent/50" />
-      <div className="mt-3 flex justify-end gap-2"><Button variant="ghost" size="sm" onClick={() => setOpen(false)}>Cancel</Button><Button size="sm" disabled={!name || busy} onClick={() => { onCreate(name); setOpen(false); }}>Create</Button></div>
+      <input autoFocus value={name} onChange={(event) => setName(event.target.value.toLowerCase())} placeholder="accounts-retype" className="mt-3 h-10 w-full rounded-md border border-border bg-background px-3 font-mono text-sm outline-none focus:border-accent/50" />
+      <div className="mt-3 flex justify-end gap-2"><Button variant="ghost" size="sm" onClick={() => setOpen(false)}>Cancel</Button><Button size="sm" disabled={!name || busy} onClick={() => { void onCreate(name); setOpen(false); }}>Create</Button></div>
     </div>
   );
 }
 
-function FirstRun({ onCreate, busy }: { onCreate: (name: string) => void; busy: boolean }) {
-  const [name, setName] = useState("billing-v2");
+function FirstRun({ onCreate, busy, onBrowse }: { onCreate: (name: string) => void; busy: boolean; onBrowse: () => void }) {
+  const [name, setName] = useState("accounts-retype");
   return (
     <StatePanel kind="first" title="Branch the real database in milliseconds" action={
-      <div className="flex gap-2">
-        <input value={name} onChange={(event) => setName(event.target.value)} className="h-10 rounded-md border border-border bg-background px-3 font-mono text-sm outline-none focus:border-accent/50" />
-        <Button disabled={busy || !name} onClick={() => onCreate(name)}>{busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <GitBranch className="h-4 w-4" />}Create first branch</Button>
+      <div className="flex flex-col items-center gap-3">
+        <div className="flex gap-2">
+          <input value={name} onChange={(event) => setName(event.target.value)} className="h-10 rounded-md border border-border bg-background px-3 font-mono text-sm outline-none focus:border-accent/50" />
+          <Button disabled={busy || !name} onClick={() => onCreate(name)}>{busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <GitBranch className="h-4 w-4" />}Create first branch</Button>
+        </div>
+        <Button variant="ghost" onClick={onBrowse}><Table2 className="h-4 w-4" />Browse main data</Button>
       </div>
     }>
-      No change branches yet. A branch is a set of views over production-shaped data: all rows, zero copied bytes.
+      No change branches yet. Main already holds the live catalog and rows — inspect it first, or create a branch (views over that data, zero copied bytes).
     </StatePanel>
   );
 }
 
-function MergeReview({ branch, diff, preview, conflicts, stats, busy, onPreview, onApply, onEdit }: {
+function MergeReview({
+  branch, diff, preview, conflicts, stats, busy, integrateTargets,
+  onPreview, onApply, onIntegrate, onIntegrated, onEdit,
+}: {
   branch: string; diff: DiffResponse | null; preview: MergePreview | null; conflicts: unknown[] | null; stats: Stats; busy: string;
-  onPreview: () => void; onApply: () => void; onEdit: () => void;
+  integrateTargets: string[];
+  onPreview: () => void; onApply: () => void;
+  onIntegrate: (target: string, previewOnly: boolean) => Promise<IntegrateResult | null>;
+  onIntegrated: (target: string) => void;
+  onEdit: () => void;
 }) {
   const [report, setReport] = useState<ValidateReport | null>(null);
+  const [integrateTarget, setIntegrateTarget] = useState(integrateTargets[0] ?? "");
+  const [integratePreview, setIntegratePreview] = useState<IntegrateResult | null>(null);
   useEffect(() => {
     setReport(null);
     void api.validate(branch).then(setReport).catch(() => setReport(null));
   }, [branch, diff]);
+  useEffect(() => {
+    setIntegratePreview(null);
+    setIntegrateTarget(integrateTargets[0] ?? "");
+  }, [branch, integrateTargets.join(",")]);
   if (conflicts) return (
-    <StatePanel kind="conflict" title="Main and this branch conflict" action={<Button variant="outline" onClick={onEdit}>Return to DDL editor</Button>}>
+    <StatePanel kind="conflict" title="The two sides conflict" action={<Button variant="outline" onClick={onEdit}>Return to DDL editor</Button>}>
       <p>Both sides changed the same catalog path differently. No resolution was guessed.</p>
       <pre className="mt-4 max-h-48 overflow-auto rounded-lg bg-black/30 p-3 text-left font-mono text-xs">{JSON.stringify(conflicts, null, 2)}</pre>
     </StatePanel>
   );
-  if (!diff?.ops.length) return <StatePanel kind="empty" title="Nothing to merge" action={<Button variant="outline" onClick={onEdit}><Code2 className="h-4 w-4" />Write DDL</Button>}>The branch working tree matches main. Add a schema change to begin a migration review.</StatePanel>;
+  if (!diff?.ops.length && !integrateTargets.length) {
+    return <StatePanel kind="empty" title="Nothing to merge" action={<Button variant="outline" onClick={onEdit}><Code2 className="h-4 w-4" />Write DDL</Button>}>The branch working tree matches main. Add a schema change to begin a migration review.</StatePanel>;
+  }
   return (
     <div className="grid grid-cols-[1fr_360px] gap-5">
       <div className="space-y-4">
-        <Card className="overflow-hidden">
-          <div className="flex items-center justify-between border-b border-border px-5 py-4"><div><h2 className="font-semibold">Compiled migration plan</h2><p className="mt-1 text-xs text-muted">branch → main · ordered, resumable, lock-guarded</p></div><Badge className="border-accent/25 bg-accent/10 text-accent">{preview ? `${preview.plan.length} steps` : `${diff.ops.length} changes`}</Badge></div>
-          {!preview ? (
-            <div className="p-8 text-center"><p className="text-sm text-muted">Compile the committed branch into its exact execution plan, risks, and timing.</p><Button className="mt-5" disabled={busy === "preview"} onClick={onPreview}>{busy === "preview" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />}Preview merge</Button></div>
-          ) : (
-            <div className="divide-y divide-border">
-              {preview.plan.map((step) => <PlanRow key={step.seq} step={step} rowCount={stats.rowCount} />)}
-            </div>
-          )}
-        </Card>
+        {!!diff?.ops.length && (
+          <Card className="overflow-hidden">
+            <div className="flex items-center justify-between border-b border-border px-5 py-4"><div><h2 className="font-semibold">Compiled migration plan</h2><p className="mt-1 text-xs text-muted">branch → main · ordered, resumable, lock-guarded</p></div><Badge className="border-accent/25 bg-accent/10 text-accent">{preview ? `${preview.plan.length} steps` : `${diff.ops.length} changes`}</Badge></div>
+            {!preview ? (
+              <div className="p-8 text-center"><p className="text-sm text-muted">Compile the committed branch into its exact execution plan, risks, and timing.</p><Button className="mt-5" disabled={busy === "preview"} onClick={onPreview}>{busy === "preview" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />}Preview merge</Button></div>
+            ) : (
+              <div className="divide-y divide-border">
+                {preview.plan.map((step) => <PlanRow key={step.seq} step={step} rowCount={stats.rowCount} />)}
+              </div>
+            )}
+          </Card>
+        )}
         {preview && <div className="flex items-center justify-between rounded-xl border border-accent/20 bg-accent/[.055] p-5"><div><div className="text-sm font-semibold">Ready to migrate main</div><div className="mt-1 text-xs text-muted">{report?.blocked ? "Pre-flight found violating rows. Fix the data or the DDL before applying." : "Live telemetry opens before execution starts."}</div></div><Button size="lg" disabled={report?.blocked} onClick={onApply}><Rocket className="h-4 w-4" />Apply {preview.plan.filter((step) => !step.manual).length} steps</Button></div>}
+        {!diff?.ops.length && (
+          <StatePanel kind="empty" title="Nothing to merge into main" action={<Button variant="outline" onClick={onEdit}><Code2 className="h-4 w-4" />Write DDL</Button>}>This branch matches main. Integrate into another branch, or add a schema change.</StatePanel>
+        )}
       </div>
       <div className="space-y-4">
-        <Card className="p-5"><div className="text-xs font-semibold uppercase tracking-[.14em] text-muted">Impact</div><div className="mt-5 grid grid-cols-2 gap-4"><Metric value={compactNumber(stats.rowCount)} label="rows in scope" /><Metric value={diff.ops.filter((op) => op.risk === "REWRITE").length.toString()} label="rewrites" /><Metric value={diff.ops.filter((op) => op.risk === "LOCKING").length.toString()} label="locking ops" /><Metric value="≤500ms" label="lock attempt" /></div>{report && <div className="mt-5 space-y-2 border-t border-border pt-4">{report.findings.length === 0 ? <p className="text-xs text-muted">No data probes for these ops.</p> : report.findings.map((finding, index) => <p key={index} className={cn("text-xs leading-5", finding.blocked ? "text-red-300" : "text-muted")}>{finding.message}</p>)}</div>}</Card>
+        {!!integrateTargets.length && (
+          <Card className="p-5">
+            <div className="text-xs font-semibold uppercase tracking-[.14em] text-muted">Integrate into a branch</div>
+            <p className="mt-3 text-xs leading-5 text-muted">Copies this branch’s committed schema onto another branch’s views. Main is not migrated. Schema only — no rows are copied.</p>
+            <label className="mt-4 block text-[11px] text-muted">Target branch</label>
+            <select value={integrateTarget} onChange={(event) => { setIntegrateTarget(event.target.value); setIntegratePreview(null); }} className="mt-2 h-10 w-full rounded-md border border-border bg-background px-3 font-mono text-sm outline-none focus:border-accent/50">
+              {integrateTargets.map((name) => <option key={name} value={name}>{name}</option>)}
+            </select>
+            <Button
+              variant="outline"
+              className="mt-3 w-full"
+              disabled={!integrateTarget || busy.startsWith("integrate")}
+              onClick={() => void onIntegrate(integrateTarget, true).then((next) => { if (next) setIntegratePreview(next); })}
+            >
+              {busy === "integrate-preview" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />}
+              Preview integrate
+            </Button>
+            {integratePreview && (
+              <div className="mt-4 space-y-3 border-t border-border pt-4">
+                <div className="text-xs text-muted">{integratePreview.ops.length ? `${integratePreview.ops.length} catalog operation${integratePreview.ops.length === 1 ? "" : "s"} onto ${integratePreview.target}` : `No schema delta — ${branch} adds nothing ${integratePreview.target} does not already have.`}</div>
+                {!!integratePreview.ops.length && (
+                  <ul className="space-y-1 font-mono text-[11px] text-muted">
+                    {integratePreview.ops.map((op, index) => <li key={`${op.kind}-${index}`}>{opTitle(op)}</li>)}
+                  </ul>
+                )}
+                <Button
+                  className="w-full"
+                  disabled={busy === "integrate"}
+                  onClick={() => void onIntegrate(integrateTarget, false).then((next) => { if (next) onIntegrated(integrateTarget); })}
+                >
+                  {busy === "integrate" ? <Loader2 className="h-4 w-4 animate-spin" /> : <GitBranch className="h-4 w-4" />}
+                  Integrate into {integrateTarget}
+                </Button>
+              </div>
+            )}
+          </Card>
+        )}
+        {!!diff?.ops.length && (
+          <Card className="p-5"><div className="text-xs font-semibold uppercase tracking-[.14em] text-muted">Impact</div><div className="mt-5 grid grid-cols-2 gap-4"><Metric value={compactNumber(stats.rowCount)} label="rows in scope" /><Metric value={diff.ops.filter((op) => op.risk === "REWRITE").length.toString()} label="rewrites" /><Metric value={diff.ops.filter((op) => op.risk === "LOCKING").length.toString()} label="locking ops" /><Metric value="≤500ms" label="lock attempt" /></div>{report && <div className="mt-5 space-y-2 border-t border-border pt-4">{report.findings.length === 0 ? <p className="text-xs text-muted">No data probes for these ops.</p> : report.findings.map((finding, index) => <p key={index} className={cn("text-xs leading-5", finding.blocked ? "text-red-300" : "text-muted")}>{finding.message}</p>)}</div>}</Card>
+        )}
         <Card className="p-5"><div className="flex gap-3"><ShieldAlert className="mt-0.5 h-4 w-4 text-amber-300" /><div><div className="text-sm font-medium">Constraints and indexes</div><Badge className="mt-3 border-violet-400/25 bg-violet-400/10 text-[10px] text-violet-300">declared — enforced on merge</Badge><p className="mt-3 text-xs leading-5 text-muted">Branch declarations do not pretend to constrain shared physical rows.</p></div></div></Card>
-        <Card className="border-red-400/20 p-5"><div className="flex gap-3"><Trash2 className="mt-0.5 h-4 w-4 text-red-300" /><div><div className="text-sm font-medium text-red-200">Contract stays manual</div><p className="mt-2 text-xs leading-5 text-muted">Permanent drops never run with this plan. Contract is offered only after a reversible merge.</p></div></div></Card>
+        <Card className="border-red-400/20 p-5"><div className="flex gap-3"><Trash2 className="mt-0.5 h-4 w-4 text-red-300" /><div><div className="text-sm font-medium text-red-200">Contract stays manual</div><p className="mt-2 text-xs leading-5 text-muted">Permanent drops never run with a main merge. Integrating another branch never contracts main.</p></div></div></Card>
       </div>
     </div>
   );
@@ -456,14 +615,36 @@ function PlanRow({ step, rowCount }: { step: MigrationStep; rowCount: number }) 
   return <div className={cn("grid grid-cols-[36px_110px_1fr_90px] items-start gap-3 px-5 py-4", step.manual && "bg-red-400/[.035]")}><div className="grid h-7 w-7 place-items-center rounded-full border border-border font-mono text-xs text-muted">{step.seq + 1}</div><div><div className="text-xs font-semibold uppercase tracking-wide">{step.kind}</div><RiskBadge risk={step.risk} /></div><code className="whitespace-pre-wrap break-all font-mono text-[11px] leading-5 text-[#b8bec7]">{step.sql}</code><div className={cn("text-right font-mono text-xs", step.manual ? "text-red-300" : "text-muted")}>{estimatedStep(step, rowCount)}</div></div>;
 }
 
-function DiffView({ branch, diff }: { branch: string; diff: DiffResponse | null }) {
-  if (!diff?.ops.length) return <StatePanel kind="empty" title="Catalogs are identical">Column ordering and SQL formatting are ignored. There are no semantic changes between main and {branch}.</StatePanel>;
+function DiffView({
+  from, to, diff, compareAgainst, onFromChange,
+}: {
+  from: string; to: string; diff: DiffResponse | null; compareAgainst: string[]; onFromChange: (from: string) => void;
+}) {
+  const picker = compareAgainst.length > 1 && (
+    <div className="mb-4 flex items-center gap-3">
+      <label className="text-xs text-muted">Compare against</label>
+      <select value={from} onChange={(event) => onFromChange(event.target.value)} className="h-9 rounded-md border border-border bg-background px-3 font-mono text-sm outline-none focus:border-accent/50">
+        {compareAgainst.map((name) => <option key={name} value={name}>{name}</option>)}
+      </select>
+    </div>
+  );
+  if (!diff?.ops.length) {
+    return (
+      <div>
+        {picker}
+        <StatePanel kind="empty" title="Catalogs are identical">Column ordering and SQL formatting are ignored. There are no semantic changes between {from} and {to}.</StatePanel>
+      </div>
+    );
+  }
   return (
-    <Card className="overflow-hidden">
-      <div className="grid grid-cols-2 border-b border-border bg-white/[.02]"><div className="border-r border-border px-5 py-4"><div className="text-xs text-muted">CURRENT</div><div className="mt-1 font-mono text-sm">main</div></div><div className="px-5 py-4"><div className="text-xs text-muted">PROPOSED</div><div className="mt-1 font-mono text-sm">{branch}</div></div></div>
-      <div className="divide-y divide-border">{diff.ops.map((op, index) => <DiffRow key={`${op.kind}-${index}`} op={op} />)}</div>
-      {!!diff.renameSuggestions.length && <div className="border-t border-amber-400/20 bg-amber-400/[.04] p-5"><div className="text-sm font-medium text-amber-200">Possible renames need confirmation</div><pre className="mt-2 font-mono text-xs text-muted">{JSON.stringify(diff.renameSuggestions, null, 2)}</pre></div>}
-    </Card>
+    <div>
+      {picker}
+      <Card className="overflow-hidden">
+        <div className="grid grid-cols-2 border-b border-border bg-white/[.02]"><div className="border-r border-border px-5 py-4"><div className="text-xs text-muted">CURRENT</div><div className="mt-1 font-mono text-sm">{from}</div></div><div className="px-5 py-4"><div className="text-xs text-muted">PROPOSED</div><div className="mt-1 font-mono text-sm">{to}</div></div></div>
+        <div className="divide-y divide-border">{diff.ops.map((op, index) => <DiffRow key={`${op.kind}-${index}`} op={op} />)}</div>
+        {!!diff.renameSuggestions.length && <div className="border-t border-amber-400/20 bg-amber-400/[.04] p-5"><div className="text-sm font-medium text-amber-200">Possible renames need confirmation</div><pre className="mt-2 font-mono text-xs text-muted">{JSON.stringify(diff.renameSuggestions, null, 2)}</pre></div>}
+      </Card>
+    </div>
   );
 }
 
@@ -482,36 +663,237 @@ function DataBrowser({ branch, schema }: { branch: string; schema: SchemaIR | nu
     setLoading(true); setError("");
     void api.rows(branch, table).then(setResult).catch((cause) => setError(messageOf(cause))).finally(() => setLoading(false));
   }, [branch, table]);
-  const columns = result?.rows[0] ? Object.keys(result.rows[0]) : schema?.tables.find((item) => item.name === table)?.columns.map((column) => column.name) ?? [];
+  const selectedTable = schema?.tables.find((item) => item.name === table);
+  const schemaColumns = [...(selectedTable?.columns ?? [])].sort((a, b) => a.ordinal - b.ordinal);
+  const columns = schemaColumns.length ? schemaColumns.map((column) => column.name) : result?.rows[0] ? Object.keys(result.rows[0]) : [];
   if (!schema?.tables.length) return <StatePanel kind="empty" title="No tables on this branch">Create a table with DDL, then return here to query it through the branch schema.</StatePanel>;
   return (
-    <div className="grid grid-cols-[220px_1fr] gap-4">
-      <Card className="p-3"><div className="px-2 py-2 text-xs font-semibold uppercase tracking-wide text-muted">Tables</div>{schema.tables.map((item) => <button key={item.name} onClick={() => setTable(item.name)} className={cn("flex w-full items-center gap-2 rounded-md px-3 py-2 text-left font-mono text-xs text-muted hover:bg-white/5", table === item.name && "bg-white/5 text-foreground")}><Table2 className="h-3.5 w-3.5" />{item.name}</button>)}</Card>
-      <Card className="min-w-0 overflow-hidden"><div className="flex items-center justify-between border-b border-border px-5 py-4"><div><div className="font-mono text-sm">{branch}.{table}</div><div className="mt-1 text-xs text-muted">{result ? `${result.rowCount.toLocaleString()} real rows · showing ${result.rows.length}` : "Querying through branch view"}</div></div>{loading && <Loader2 className="h-4 w-4 animate-spin text-accent" />}</div>{error ? <div className="p-5 text-sm text-red-300">{error}</div> : <div className="max-h-[620px] overflow-auto scrollbar-thin"><table className="w-full border-collapse text-left font-mono text-xs"><thead className="sticky top-0 bg-panel">{columns.map((column) => <th key={column} className="border-b border-r border-border px-4 py-3 font-medium text-muted">{column}</th>)}</thead><tbody>{result?.rows.map((row, rowIndex) => <tr key={rowIndex} className="hover:bg-white/[.025]">{columns.map((column) => <td key={column} className="max-w-72 truncate border-b border-r border-border/70 px-4 py-3">{row[column] == null ? <span className="text-muted/50">NULL</span> : String(row[column])}</td>)}</tr>)}</tbody></table></div>}</Card>
+    <div className="grid grid-cols-[260px_1fr] gap-4">
+      <Card className="h-fit p-3">
+        <div className="px-2 py-2 text-xs font-semibold uppercase tracking-wide text-muted">Tables</div>
+        {schema.tables.map((item) => (
+          <button
+            key={item.name}
+            onClick={() => setTable(item.name)}
+            className={cn("w-full rounded-md px-3 py-2.5 text-left hover:bg-white/5", table === item.name && "bg-white/5")}
+          >
+            <div className={cn("flex items-center gap-2 font-mono text-xs text-muted", table === item.name && "text-foreground")}>
+              <Table2 className="h-3.5 w-3.5 shrink-0" />
+              {item.name}
+            </div>
+            <div className="mt-1.5 flex flex-wrap gap-1 pl-6">
+              {item.constraints.length === 0 ? (
+                <span className="text-[10px] text-muted/55">no constraints</span>
+              ) : item.constraints.map((constraint) => (
+                <span
+                  key={constraint.name}
+                  className={cn("rounded border px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide", constraintKindClasses[constraint.kind])}
+                >
+                  {constraintKindShort(constraint.kind)}
+                  {constraint.columns[0] ? ` ${constraint.columns[0]}` : ""}
+                </span>
+              ))}
+            </div>
+          </button>
+        ))}
+      </Card>
+      <div className="min-w-0 space-y-4">
+        <TableSchemaCard table={selectedTable} declared={branch !== "main"} />
+        <Card className="min-w-0 overflow-hidden">
+          <div className="flex items-center justify-between border-b border-border px-5 py-4">
+            <div>
+              <div className="font-mono text-sm">{branch}.{table}</div>
+              <div className="mt-1 text-xs text-muted">{result ? `${result.rowCount.toLocaleString()} real rows · showing ${result.rows.length}` : "Querying through branch view"}</div>
+            </div>
+            {loading && <Loader2 className="h-4 w-4 animate-spin text-accent" />}
+          </div>
+          {error ? (
+            <div className="p-5 text-sm text-red-300">{error}</div>
+          ) : (
+            <div className="max-h-[620px] overflow-auto scrollbar-thin">
+              <table className="w-full border-collapse text-left font-mono text-xs">
+                <thead className="sticky top-0 bg-panel">
+                  <tr>
+                    {(schemaColumns.length ? schemaColumns : columns.map((name) => ({ name, type: "", nullable: true }))).map((column) => (
+                      <th key={column.name} className="border-b border-r border-border px-4 py-3 font-medium text-muted">
+                        <div>{column.name}</div>
+                        {column.type && (
+                          <div className="mt-1 text-[10px] font-normal text-muted/65">
+                            {shortType(column.type)}{column.nullable ? "" : " · not null"}
+                          </div>
+                        )}
+                      </th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {result?.rows.map((row, rowIndex) => (
+                    <tr key={rowIndex} className="hover:bg-white/[.025]">
+                      {columns.map((column) => (
+                        <td key={column} className="max-w-72 truncate border-b border-r border-border/70 px-4 py-3">
+                          {row[column] == null ? <span className="text-muted/50">NULL</span> : String(row[column])}
+                        </td>
+                      ))}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </Card>
+      </div>
     </div>
   );
 }
 
-function Editor({ branch, onChanged, onReview }: { branch: string; onChanged: () => Promise<void>; onReview: () => void }) {
+function TableSchemaCard({ table, declared }: { table: Table | undefined; declared: boolean }) {
+  if (!table) return null;
+  return (
+    <Card className="overflow-hidden">
+      <div className="flex items-center justify-between border-b border-border px-5 py-3">
+        <div>
+          <div className="text-sm font-semibold">Constraints on {table.name}</div>
+          <p className="mt-1 text-xs text-muted">
+            {table.constraints.length} constraint{table.constraints.length === 1 ? "" : "s"}
+            {table.indexes.length ? ` · ${table.indexes.length} index${table.indexes.length === 1 ? "" : "es"}` : ""}
+          </p>
+        </div>
+        {declared && <Badge className="border-violet-400/25 bg-violet-400/10 text-violet-300">declared — enforced on merge</Badge>}
+      </div>
+      {table.constraints.length === 0 ? (
+        <p className="px-5 py-4 text-xs text-muted">No constraints on this table.</p>
+      ) : (
+        <div className="divide-y divide-border">
+          {table.constraints.map((constraint) => (
+            <div key={constraint.name} className="flex items-start gap-4 px-5 py-3.5">
+              <div className={cn("mt-0.5 grid h-8 w-8 shrink-0 place-items-center rounded-lg border", constraintKindClasses[constraint.kind])}>
+                <ConstraintKindIcon kind={constraint.kind} />
+              </div>
+              <div className="min-w-0 flex-1">
+                <div className="flex flex-wrap items-center gap-2">
+                  <Badge className={constraintKindClasses[constraint.kind]}>{constraintKindLabel(constraint.kind)}</Badge>
+                  <span className="font-mono text-xs">{constraint.name}</span>
+                </div>
+                {constraintDetail(constraint) && (
+                  <div className="mt-1.5 font-mono text-[11px] text-muted">{constraintDetail(constraint)}</div>
+                )}
+              </div>
+              <span className={cn("shrink-0 text-[10px] font-semibold uppercase tracking-wide", constraint.validated ? "text-emerald-300" : "text-amber-300")}>
+                {constraint.validated ? "validated" : "not valid"}
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
+      {table.indexes.length > 0 && (
+        <div className="border-t border-border">
+          <div className="px-5 py-2 text-[10px] font-semibold uppercase tracking-[.14em] text-muted">Indexes</div>
+          <div className="divide-y divide-border">
+            {table.indexes.map((index) => <IndexRow key={index.name} index={index} />)}
+          </div>
+        </div>
+      )}
+    </Card>
+  );
+}
+
+function ConstraintKindIcon({ kind }: { kind: Constraint["kind"] }) {
+  const className = "h-3.5 w-3.5";
+  if (kind === "primary") return <Key className={className} />;
+  if (kind === "unique") return <Hash className={className} />;
+  if (kind === "check") return <ShieldCheck className={className} />;
+  return <Link2 className={className} />;
+}
+
+function IndexRow({ index }: { index: Index }) {
+  return (
+    <div className="flex flex-wrap items-center gap-3 px-5 py-2.5 font-mono text-xs">
+      <span>{index.name}</span>
+      <span className="text-muted">{index.method} ({index.columns.join(", ")})</span>
+      {index.unique && <Badge className="border-violet-400/25 bg-violet-400/10 text-violet-300">unique</Badge>}
+      {index.predicate && <span className="text-muted">WHERE {index.predicate}</span>}
+    </div>
+  );
+}
+
+function Editor({
+  branch,
+  creating,
+  onCreate,
+  onChanged,
+  onReview,
+}: {
+  branch: string;
+  creating: boolean;
+  onCreate: (name: string) => Promise<void>;
+  onChanged: (name?: string) => Promise<void>;
+  onReview: () => void;
+}) {
+  const onMain = branch === "main";
   const [sql, setSql] = useState(EXAMPLE_DDL);
-  const [message, setMessage] = useState("Add billing tier and country index");
+  const [newBranch, setNewBranch] = useState("accounts-retype");
+  const [message, setMessage] = useState("Retype accounts.name to varchar(200)");
   const [status, setStatus] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  const locked = busy || creating;
   const apply = async () => {
     setBusy(true); setError("");
-    try { const result = await api.ddl(branch, sql); await onChanged(); setStatus(`${result.ops.length} catalog operation${result.ops.length === 1 ? "" : "s"} applied to working tree`); }
-    catch (cause) { setError(messageOf(cause)); } finally { setBusy(false); }
+    try {
+      const target = onMain ? newBranch.trim().toLowerCase() : branch;
+      if (onMain) {
+        if (!target) throw new Error("Name a branch before applying DDL. Main is the merge target.");
+        await onCreate(target);
+      }
+      const result = await api.ddl(target, sql);
+      await onChanged(target);
+      setStatus(`${result.ops.length} catalog operation${result.ops.length === 1 ? "" : "s"} applied to working tree`);
+    } catch (cause) { setError(messageOf(cause)); } finally { setBusy(false); }
   };
   const commit = async () => {
+    if (onMain) return;
     setBusy(true); setError("");
-    try { await api.commit(branch, message); await onChanged(); setStatus("Committed. Branch is ready for merge preview."); }
+    try { await api.commit(branch, message); await onChanged(branch); setStatus("Committed. Branch is ready for merge preview."); }
     catch (cause) { setError(messageOf(cause)); } finally { setBusy(false); }
   };
   return (
     <div className="grid grid-cols-[1fr_330px] gap-5">
-      <Card className="overflow-hidden"><div className="flex items-center justify-between border-b border-border px-5 py-3"><div className="font-mono text-xs text-muted">branch://{branch}/schema.sql</div><Badge>PostgreSQL DDL only</Badge></div><div className="relative"><div className="absolute bottom-0 left-0 top-0 w-12 select-none border-r border-border bg-black/15 pt-5 text-right font-mono text-xs leading-6 text-muted/50">{sql.split("\n").map((_, index) => <div key={index} className="pr-3">{index + 1}</div>)}</div><textarea spellCheck={false} value={sql} onChange={(event) => setSql(event.target.value)} className="h-[520px] w-full resize-none bg-transparent py-5 pl-16 pr-5 font-mono text-[13px] leading-6 text-[#d3d7dc] outline-none" /></div><div className="flex items-center justify-between border-t border-border px-5 py-4"><div className="text-xs text-muted">Parsed by PostgreSQL · DML rejected</div><Button disabled={busy || !sql.trim()} onClick={apply}>{busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />}Apply to branch</Button></div></Card>
-      <div className="space-y-4"><Card className="p-5"><div className="text-sm font-semibold">Working tree → commit</div><p className="mt-2 text-xs leading-5 text-muted">DDL updates branch views immediately. Merge preview accepts committed state only.</p><input value={message} onChange={(event) => setMessage(event.target.value)} className="mt-4 h-10 w-full rounded-md border border-border bg-background px-3 text-sm outline-none focus:border-accent/50" /><Button variant="outline" className="mt-3 w-full" disabled={busy || !message.trim()} onClick={commit}><Check className="h-4 w-4" />Commit schema state</Button><Button variant="ghost" className="mt-2 w-full" onClick={onReview}>Open merge review <ArrowRight className="h-4 w-4" /></Button></Card><Card className="p-5"><Badge className="border-violet-400/25 bg-violet-400/10 text-violet-300">declared — enforced on merge</Badge><p className="mt-3 text-xs leading-5 text-muted">Constraints and indexes are recorded as desired schema state. They are validated and created against real data during merge.</p></Card>{status && <div className="rounded-lg border border-accent/20 bg-accent/[.05] p-4 text-xs text-accent">{status}</div>}{error && <div className="rounded-lg border border-red-400/20 bg-red-400/[.05] p-4 text-xs text-red-300">{error}</div>}</div>
+      <Card className="overflow-hidden">
+        <div className="flex items-center justify-between border-b border-border px-5 py-3">
+          <div className="font-mono text-xs text-muted">branch://{onMain ? (newBranch.trim() || "new-branch") : branch}/schema.sql</div>
+          <Badge>PostgreSQL DDL only</Badge>
+        </div>
+        <div className="relative">
+          <div className="absolute bottom-0 left-0 top-0 w-12 select-none border-r border-border bg-black/15 pt-5 text-right font-mono text-xs leading-6 text-muted/50">{sql.split("\n").map((_, index) => <div key={index} className="pr-3">{index + 1}</div>)}</div>
+          <textarea spellCheck={false} value={sql} onChange={(event) => setSql(event.target.value)} className="h-[520px] w-full resize-none bg-transparent py-5 pl-16 pr-5 font-mono text-[13px] leading-6 text-[#d3d7dc] outline-none" />
+        </div>
+        <div className="flex items-center justify-between border-t border-border px-5 py-4">
+          <div className="text-xs text-muted">{onMain ? "Creates a branch, then applies there — main stays untouched" : "Parsed by PostgreSQL · DML rejected"}</div>
+          <Button disabled={locked || !sql.trim() || (onMain && !newBranch.trim())} onClick={() => void apply()}>
+            {locked ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />}
+            {onMain ? "Create branch and apply" : "Apply to branch"}
+          </Button>
+        </div>
+      </Card>
+      <div className="space-y-4">
+        {onMain && (
+          <Card className="p-5">
+            <div className="text-sm font-semibold">Branch from main</div>
+            <p className="mt-2 text-xs leading-5 text-muted">Main cannot take DDL directly. Name the change branch this SQL will apply to.</p>
+            <input value={newBranch} onChange={(event) => setNewBranch(event.target.value.toLowerCase())} placeholder="accounts-retype" className="mt-4 h-10 w-full rounded-md border border-border bg-background px-3 font-mono text-sm outline-none focus:border-accent/50" />
+          </Card>
+        )}
+        <Card className="p-5">
+          <div className="text-sm font-semibold">Working tree → commit</div>
+          <p className="mt-2 text-xs leading-5 text-muted">DDL updates branch views immediately. Merge preview accepts committed state only.</p>
+          <input value={message} onChange={(event) => setMessage(event.target.value)} className="mt-4 h-10 w-full rounded-md border border-border bg-background px-3 text-sm outline-none focus:border-accent/50" />
+          <Button variant="outline" className="mt-3 w-full" disabled={onMain || locked || !message.trim()} onClick={() => void commit()}><Check className="h-4 w-4" />Commit schema state</Button>
+          <Button variant="ghost" className="mt-2 w-full" disabled={onMain} onClick={onReview}>Open merge review <ArrowRight className="h-4 w-4" /></Button>
+        </Card>
+        <Card className="p-5"><Badge className="border-violet-400/25 bg-violet-400/10 text-violet-300">declared — enforced on merge</Badge><p className="mt-3 text-xs leading-5 text-muted">Constraints and indexes are recorded as desired schema state. They are validated and created against real data during merge.</p></Card>
+        {status && <div className="rounded-lg border border-accent/20 bg-accent/[.05] p-4 text-xs text-accent">{status}</div>}
+        {error && <div className="rounded-lg border border-red-400/20 bg-red-400/[.05] p-4 text-xs text-red-300">{error}</div>}
+      </div>
     </div>
   );
 }
@@ -548,6 +930,6 @@ function MetricCard({ value, label }: { value: string; label: string }) {
 }
 
 function messageOf(cause: unknown): string {
-  if (cause instanceof ApiError && cause.body.state === "dirty") return "This branch has uncommitted DDL. Commit the working tree before previewing a merge.";
+  if (cause instanceof ApiError && cause.body.state === "dirty") return "A branch has uncommitted DDL. Commit both working trees before merging or integrating.";
   return cause instanceof Error ? cause.message : "Unexpected failure";
 }

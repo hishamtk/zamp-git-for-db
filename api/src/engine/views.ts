@@ -1,6 +1,6 @@
 import { qid, qname, assertTypeExpr, MAIN_SCHEMA } from "../ident.js";
 import type { SchemaIR, Table } from "../ir/types.js";
-import { findTable } from "../ir/types.js";
+import { columnsInPhysicalOrder, findTable } from "../ir/types.js";
 
 /**
  * Generating the SQL that makes a branch a virtual schema overlay.
@@ -41,7 +41,7 @@ export function selectListFor(branchTable: Table, parentTable: Table): string {
   const parentPhysical = new Set(parentTable.columns.map((c) => c.name));
   const items: string[] = [];
 
-  for (const col of branchTable.columns) {
+  for (const col of columnsInPhysicalOrder(branchTable)) {
     const physical = col.physicalName;
     const alias = qid(col.name);
 
@@ -88,7 +88,7 @@ export function createViewSQL(
 }
 
 export function createTableSQL(schema: string, table: Table): string {
-  const cols = table.columns.map((c) => {
+  const cols = columnsInPhysicalOrder(table).map((c) => {
     const parts = [qid(c.name), assertTypeExpr(c.type)];
     if (!c.nullable) parts.push("NOT NULL");
     if (c.default) parts.push(`DEFAULT ${c.default}`);

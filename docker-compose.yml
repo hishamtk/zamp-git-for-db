@@ -1,5 +1,10 @@
 name: gitdb
 
+# api/web bind-mount source and run tsx watch / Vite HMR.
+# Edit files on the host — no image rebuild. Rebuild only when
+# package-lock.json or a Dockerfile changes.
+# Frozen nginx/node images still live in api/Dockerfile and web/Dockerfile.
+
 services:
   db:
     image: postgres:17
@@ -51,11 +56,18 @@ services:
   api:
     build:
       context: .
-      dockerfile: api/Dockerfile
+      dockerfile: Dockerfile.dev
+    working_dir: /app/api
+    command: ["npx", "tsx", "watch", "src/index.ts"]
     environment:
       DATABASE_URL: postgres://gitdb:gitdb@db:5432/gitdb
       PORT: "8080"
-      NODE_ENV: production
+      HOST: "0.0.0.0"
+      NODE_ENV: development
+    volumes:
+      - ./api/src:/app/api/src
+      - ./api/tsconfig.json:/app/api/tsconfig.json
+      - ./infra:/app/infra
     ports:
       - "${API_PORT:-8080}:8080"
     depends_on:
@@ -73,17 +85,28 @@ services:
   web:
     build:
       context: .
-      dockerfile: web/Dockerfile
+      dockerfile: Dockerfile.dev
+    command: ["npm", "run", "dev", "--workspace=web"]
     environment:
       API_ORIGIN: http://api:8080
+      CHOKIDAR_USEPOLLING: "true"
+      HMR_CLIENT_PORT: ${WEB_PORT:-5173}
+    volumes:
+      - ./web/src:/app/web/src
+      - ./web/index.html:/app/web/index.html
+      - ./web/vite.config.ts:/app/web/vite.config.ts
+      - ./web/tailwind.config.js:/app/web/tailwind.config.js
+      - ./web/postcss.config.js:/app/web/postcss.config.js
+      - ./web/tsconfig.json:/app/web/tsconfig.json
+      - ./api/src:/app/api/src
     ports:
-      - "${WEB_PORT:-5173}:80"
+      - "${WEB_PORT:-5173}:5173"
     depends_on:
       api:
         condition: service_healthy
     restart: always
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1/ >/dev/null || exit 1"]
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:5173/').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
       interval: 5s
       timeout: 3s
       retries: 20

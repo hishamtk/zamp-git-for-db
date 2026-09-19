@@ -84,6 +84,44 @@ export async function requireCommit(sql: Sql, id: string): Promise<Commit> {
   return c;
 }
 
+/**
+ * First shared commit walking `parent_id` from `right` toward root, after
+ * collecting every ancestor of `left` (including `left` itself).
+ */
+export function lowestCommonAncestorId(
+  parents: Map<string, string | null>,
+  left: string,
+  right: string,
+): string | null {
+  const ancestors = new Set<string>();
+  for (let id: string | null = left; id && !ancestors.has(id); ) {
+    ancestors.add(id);
+    if (!parents.has(id)) break;
+    id = parents.get(id) ?? null;
+  }
+  const seen = new Set<string>();
+  for (let id: string | null = right; id && !seen.has(id); ) {
+    if (ancestors.has(id)) return id;
+    seen.add(id);
+    if (!parents.has(id)) break;
+    id = parents.get(id) ?? null;
+  }
+  return null;
+}
+
+export async function lowestCommonAncestor(sql: Sql, left: string, right: string): Promise<Commit> {
+  const rows = await sql<{ id: string; parent_id: string | null }[]>`
+    SELECT id, parent_id FROM gitdb.commits`;
+  const id = lowestCommonAncestorId(new Map(rows.map((row) => [row.id, row.parent_id])), left, right);
+  if (!id) {
+    throw Object.assign(new Error("no common ancestor between the two branches"), {
+      statusCode: 409,
+      code: "no_common_ancestor",
+    });
+  }
+  return requireCommit(sql, id);
+}
+
 /** Newest-first commit list for a branch. */
 export async function log(sql: Sql, branch: string, limit = 50): Promise<Commit[]> {
   const rows = await sql<Commit[]>`
