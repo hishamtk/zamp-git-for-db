@@ -9,9 +9,10 @@ import { UnsupportedDDL } from "./ir/parse.js";
 import { branchRoutes } from "./routes/branches.js";
 import { diffRoutes } from "./routes/diff.js";
 import { mergeRoutes } from "./routes/merges.js";
+import { rewindRoutes } from "./routes/rewinds.js";
 import { systemRoutes } from "./routes/system.js";
 import { BranchError } from "./vcs/branches.js";
-import { bootstrap } from "./vcs/commits.js";
+import { bootstrap, RewindError } from "./vcs/commits.js";
 
 export async function buildApp(): Promise<FastifyInstance> {
   const app = Fastify({ logger: true });
@@ -36,7 +37,7 @@ export async function buildApp(): Promise<FastifyInstance> {
     if (error instanceof ZodError) {
       return reply.code(400).send({ error: "invalid_request", message: error.issues[0]?.message, issues: error.issues });
     }
-    if (error instanceof BranchError) {
+    if (error instanceof BranchError || error instanceof RewindError) {
       return reply.code(error.status).send({ error: error.code, message: error.message });
     }
     if (error instanceof InvalidIdentifier || error instanceof UnsupportedDDL) {
@@ -58,6 +59,7 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(branchRoutes);
   await app.register(diffRoutes);
   await app.register(mergeRoutes);
+  await app.register(rewindRoutes);
   return app;
 }
 

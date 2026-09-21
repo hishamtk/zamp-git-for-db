@@ -8,6 +8,7 @@ import {
   Code2,
   Database,
   GitBranch,
+  History,
   Hash,
   Key,
   Link2,
@@ -27,11 +28,13 @@ import {
   ApiError,
   api,
   type Branch,
+  type CommitLogEntry,
   type DiffResponse,
   type IntegrateResult,
   type MergeDetail,
   type MergePreview,
   type MigrationStep,
+  type RewindPreview,
   type Risk,
   type RiskOp,
   type Constraint,
@@ -187,6 +190,8 @@ export default function App() {
   const [mainDiff, setMainDiff] = useState<DiffResponse | null>(null);
   const [compareFrom, setCompareFrom] = useState("main");
   const [preview, setPreview] = useState<MergePreview | null>(null);
+  const [rewindPreview, setRewindPreview] = useState<RewindPreview | null>(null);
+  const [history, setHistory] = useState<CommitLogEntry[]>([]);
   const [merge, setMerge] = useState<MergeDetail | null>(null);
   const [telemetry, setTelemetry] = useState<Telemetry[]>([]);
   const [conflicts, setConflicts] = useState<unknown[] | null>(null);
@@ -215,6 +220,7 @@ export default function App() {
         const firstBranch = next.find((branch) => branch.name !== "main")?.name ?? "main";
         setSelected(firstBranch);
         await refreshBranch(firstBranch);
+        if (firstBranch === "main") setHistory(await api.log("main"));
       } catch (cause) {
         setError(cause instanceof Error ? cause.message : "Could not reach the API");
       } finally {
@@ -262,10 +268,14 @@ export default function App() {
     setSelected(name);
     setCompareFrom("main");
     setPreview(null);
+    setRewindPreview(null);
     setMerge(null);
     setConflicts(null);
     setError("");
-    try { await refreshBranch(name); } catch (cause) { setError(messageOf(cause)); }
+    try {
+      await refreshBranch(name);
+      if (name === "main") setHistory(await api.log("main"));
+    } catch (cause) { setError(messageOf(cause)); }
   };
 
   const firstRun = !loading && branches.every((branch) => branch.name === "main");
@@ -322,14 +332,20 @@ export default function App() {
   };
 
   const resetDemo = async () => {
-    if (!confirm("Reset the demo? This deletes every change branch and restores main to the seeded snapshot.")) return;
+    if (!confirm("Reset the demo? This deletes every change branch, clears merge history, and restores main to the seeded snapshot.")) return;
     setBusy("reset");
     setError("");
     try {
       await api.resetDemo();
       setPreview(null);
+      setRewindPreview(null);
       setMerge(null);
       setConflicts(null);
+      setTelemetry([]);
+      setHistory([]);
+      setDiff(null);
+      setMainDiff(null);
+      if (screen === "live") setScreen("review");
       await refreshBranches();
       await chooseBranch("main");
     } catch (cause) { setError(messageOf(cause)); }
@@ -347,6 +363,33 @@ export default function App() {
       .catch((cause) => setError(messageOf(cause)))
       .finally(() => setBusy(""));
     window.setTimeout(() => void api.merge(preview.id).then(setMerge), 250);
+  };
+
+  const applyRewind = async () => {
+    if (!rewindPreview) return;
+    setTelemetry([]);
+    setMerge({ ...rewindPreview, steps: rewindPreview.plan.map((step) => ({ ...step, state: "pending", rows_done: 0, rows_total: null, lock_attempts: 0, ms: null })) });
+    setScreen("live");
+    setBusy("rewind");
+    void api.applyRewind(rewindPreview.id)
+      .then(async (next) => {
+        setMerge(next);
+        await refreshBranches();
+        setHistory(await api.log("main"));
+        setRewindPreview(null);
+      })
+      .catch((cause) => setError(messageOf(cause)))
+      .finally(() => setBusy(""));
+    window.setTimeout(() => void api.merge(rewindPreview.id).then(setMerge), 250);
+  };
+
+  const loadRewindPreview = async (commit: string) => {
+    setBusy("rewind-preview");
+    setError("");
+    try {
+      setRewindPreview(await api.previewRewind({ commit }));
+    } catch (cause) { setError(messageOf(cause)); }
+    finally { setBusy(""); }
   };
 
   return (
@@ -429,10 +472,27 @@ export default function App() {
             {error && <FailureBanner message={error} onClose={() => setError("")} />}
             {loading ? (
               <StatePanel kind="progress" title="Reading database state">Loading branches, catalog IR, and row estimates.</StatePanel>
-            ) : firstRun && screen !== "data" && screen !== "editor" ? (
+            ) : firstRun && screen !== "data" && screen !== "editor" && screen !== "review" ? (
               <FirstRun onCreate={(name) => void createBranch(name).catch(() => undefined)} busy={busy === "create"} onBrowse={() => setScreen("data")} />
+            ) : selected === "main" && screen === "review" ? (
+              <MainRewind
+                history={history}
+                preview={rewindPreview}
+                stats={selectedStats}
+                busy={busy}
+                onPreview={loadRewindPreview}
+                onApply={() => void applyRewind()}
+              />
+            ) : selected === "main" && screen === "live" && merge ? (
+              <LiveMerge
+                merge={merge}
+                telemetry={telemetry}
+                onRefresh={() => merge && void api.merge(merge.id).then(setMerge).catch((cause) => setError(messageOf(cause)))}
+                onRevert={async () => { if (merge) setMerge(await api.revertMerge(merge.id)); }}
+                onContract={async () => { if (merge) setMerge(await api.contractMerge(merge.id)); }}
+              />
             ) : selected === "main" && screen !== "data" && screen !== "editor" ? (
-              <StatePanel kind="empty" title="Select a change branch">Main is the protected merge target. Choose a branch to review, diff, or edit.</StatePanel>
+              <StatePanel kind="empty" title="Select a change branch">Main is the protected merge target. Choose a branch to review, diff, or edit — or open Merge review to rewind main.</StatePanel>
             ) : screen === "review" ? (
               <MergeReview
                 branch={selected}
@@ -509,6 +569,112 @@ function FirstRun({ onCreate, busy, onBrowse }: { onCreate: (name: string) => vo
     }>
       No change branches yet. Main already holds the live catalog and rows — inspect it first, or create a branch (views over that data, zero copied bytes).
     </StatePanel>
+  );
+}
+
+function shortHash(id: string): string {
+  return id.slice(0, 12);
+}
+
+function MainRewind({
+  history, preview, stats, busy, onPreview, onApply,
+}: {
+  history: CommitLogEntry[];
+  preview: RewindPreview | null;
+  stats: Stats;
+  busy: string;
+  onPreview: (commit: string) => void;
+  onApply: () => void;
+}) {
+  const head = history[0];
+  return (
+    <div className="grid grid-cols-[1fr_380px] gap-5">
+      <Card className="overflow-hidden">
+        <div className="border-b border-border px-5 py-4">
+          <h2 className="font-semibold">Main history</h2>
+          <p className="mt-1 text-xs text-muted">Rewind compiles one expand → backfill → cutover plan to an ancestor. Contract still drops leftover columns.</p>
+        </div>
+        {history.length === 0 ? (
+          <div className="p-8 text-center text-sm text-muted">No commits on main yet.</div>
+        ) : (
+          <div className="divide-y divide-border">
+            {history.map((commit, index) => {
+              const selected = preview?.targetCommit === commit.id;
+              return (
+                <div key={commit.id} className={cn("flex items-start justify-between gap-4 px-5 py-4", selected && "bg-accent/[.04]")}>
+                  <div className="min-w-0">
+                    <div className="flex items-center gap-2">
+                      <History className="h-3.5 w-3.5 text-muted" />
+                      <span className="font-mono text-xs">{shortHash(commit.id)}</span>
+                      {index === 0 && <Badge className="border-accent/25 bg-accent/10 text-accent">HEAD</Badge>}
+                    </div>
+                    <div className="mt-2 text-sm">{commit.message}</div>
+                    <div className="mt-1 text-[11px] text-muted">{new Date(commit.created_at).toLocaleString()}</div>
+                  </div>
+                  {index === 0 ? (
+                    <span className="text-[11px] text-muted">current</span>
+                  ) : (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      disabled={busy === "rewind-preview"}
+                      onClick={() => onPreview(commit.id)}
+                    >
+                      {busy === "rewind-preview" && selected ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />}
+                      Rewind here
+                    </Button>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </Card>
+      <div className="space-y-4">
+        {preview ? (
+          <>
+            <Card className="overflow-hidden">
+              <div className="border-b border-border px-5 py-4">
+                <div className="text-sm font-semibold">Rewind plan</div>
+                <p className="mt-1 text-xs text-muted">
+                  Undoes {preview.undone.length} commit{preview.undone.length === 1 ? "" : "s"} to {shortHash(preview.targetCommit)} as one migration.
+                </p>
+              </div>
+              <div className="divide-y divide-border">
+                {preview.plan.length
+                  ? preview.plan.map((step) => <PlanRow key={step.seq} step={step} rowCount={stats.rowCount} />)
+                  : <p className="px-5 py-4 text-xs text-muted">Catalog already matches the ancestor. Applying only moves HEAD.</p>}
+              </div>
+            </Card>
+            {!!preview.undone.length && (
+              <Card className="p-5">
+                <div className="text-xs font-semibold uppercase tracking-[.14em] text-muted">Commits leaving HEAD</div>
+                <ul className="mt-3 space-y-2 font-mono text-[11px] text-muted">
+                  {preview.undone.map((commit) => (
+                    <li key={commit.id}>{shortHash(commit.id)} · {commit.message}</li>
+                  ))}
+                </ul>
+              </Card>
+            )}
+            <div className="rounded-xl border border-accent/20 bg-accent/[.055] p-5">
+              <div className="text-sm font-semibold">Move main back</div>
+              <p className="mt-1 text-xs text-muted">Uses the same lock-guarded runner as merge. Drop steps stay manual.</p>
+              <Button className="mt-4 w-full" size="lg" disabled={busy === "rewind"} onClick={onApply}>
+                {busy === "rewind" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Rocket className="h-4 w-4" />}
+                Apply rewind
+              </Button>
+            </div>
+          </>
+        ) : (
+          <Card className="p-5">
+            <div className="text-sm font-semibold">{head ? `HEAD ${shortHash(head.id)}` : "Main"}</div>
+            <p className="mt-2 text-xs leading-5 text-muted">
+              Pick an ancestor to compile a single schema migration back to that commit. Dropped column data after contract is gone unless it can be recomputed from columns that remain.
+            </p>
+          </Card>
+        )}
+      </div>
+    </div>
   );
 }
 
@@ -909,7 +1075,7 @@ function LiveMerge({ merge, telemetry, onRefresh, onRevert, onContract }: { merg
   const running = ["planned", "running"].includes(merge.state);
   return (
     <div className="space-y-5">
-      <Card className="p-6"><div className="flex items-start justify-between"><div className="flex gap-4">{running ? <div className="grid h-11 w-11 place-items-center rounded-full bg-accent/10"><Loader2 className="h-5 w-5 animate-spin text-accent" /></div> : <div className="grid h-11 w-11 place-items-center rounded-full bg-emerald-400/10"><Check className="h-5 w-5 text-emerald-300" /></div>}<div><div className="text-lg font-semibold">{running ? "Migration in progress" : `Merge ${merge.state}`}</div><div className="mt-1 font-mono text-xs text-muted">merge #{merge.id} · branch → main</div></div></div><Badge className={running ? "border-accent/25 bg-accent/10 text-accent" : "border-emerald-400/25 bg-emerald-400/10 text-emerald-300"}>{merge.state}</Badge></div><div className="mt-7 h-2 overflow-hidden rounded-full bg-white/5"><div className="h-full rounded-full bg-accent transition-all duration-500" style={{ width: `${percent}%` }} /></div><div className="mt-3 flex justify-between font-mono text-xs text-muted"><span>{percent.toFixed(1)}%</span><span>{rowsTotal ? `${rowsDone.toLocaleString()} / ${rowsTotal.toLocaleString()} rows` : "catalog steps"}</span></div></Card>
+      <Card className="p-6"><div className="flex items-start justify-between"><div className="flex gap-4">{running ? <div className="grid h-11 w-11 place-items-center rounded-full bg-accent/10"><Loader2 className="h-5 w-5 animate-spin text-accent" /></div> : <div className="grid h-11 w-11 place-items-center rounded-full bg-emerald-400/10"><Check className="h-5 w-5 text-emerald-300" /></div>}<div><div className="text-lg font-semibold">{running ? "Migration in progress" : `Merge ${merge.state}`}</div><div className="mt-1 font-mono text-xs text-muted">merge #{merge.id} · {merge.source_branch === "rewind" ? "rewind → main" : "branch → main"}</div></div></div><Badge className={running ? "border-accent/25 bg-accent/10 text-accent" : "border-emerald-400/25 bg-emerald-400/10 text-emerald-300"}>{merge.state}</Badge></div><div className="mt-7 h-2 overflow-hidden rounded-full bg-white/5"><div className="h-full rounded-full bg-accent transition-all duration-500" style={{ width: `${percent}%` }} /></div><div className="mt-3 flex justify-between font-mono text-xs text-muted"><span>{percent.toFixed(1)}%</span><span>{rowsTotal ? `${rowsDone.toLocaleString()} / ${rowsTotal.toLocaleString()} rows` : "catalog steps"}</span></div></Card>
       <div className="grid grid-cols-4 gap-4"><MetricCard value={`${Number(latest.rowsPerSec ?? 0).toLocaleString()}`} label="rows / second" /><MetricCard value={`${merge.steps?.reduce((sum, step) => sum + Number(step.lock_attempts ?? 0), 0) ?? 0}`} label="lock attempts" /><MetricCard value={bytes(Number(latest.bloatBytes ?? 0))} label="live bloat" /><MetricCard value={latest.etaSec ? `${Math.ceil(Number(latest.etaSec))}s` : "—"} label="ETA" /></div>
       <div className="grid grid-cols-[1fr_390px] gap-5"><Card className="overflow-hidden"><div className="border-b border-border px-5 py-4 text-sm font-semibold">Execution steps</div><div className="divide-y divide-border">{merge.steps?.map((step) => <div key={step.seq} className="grid grid-cols-[28px_100px_1fr_90px] items-center gap-3 px-5 py-3 text-xs"><span className={cn("h-2 w-2 rounded-full bg-muted/40", step.state === "done" && "bg-accent", step.state === "running" && "animate-pulse bg-amber-300", step.state === "failed" && "bg-red-400")} /><span className="font-semibold uppercase">{step.kind}</span><span className="truncate font-mono text-muted">{step.error ?? step.sql}</span><span className="text-right font-mono text-muted">{step.state}</span></div>)}</div></Card><Card className="overflow-hidden"><div className="border-b border-border px-5 py-4 text-sm font-semibold">Event stream</div><div className="h-72 space-y-2 overflow-auto p-4 font-mono text-[11px] scrollbar-thin">{telemetry.length ? telemetry.slice(-50).map((event, index) => <div key={index} className="rounded bg-black/25 p-2 text-muted"><span className="mr-2 text-accent">›</span>{String(event.type ?? "event")} {event.type === "lock_retry" ? `attempt ${Number(event.attempt) + 1}` : event.type === "backfill_progress" ? `${Number(event.rowsPerSec ?? 0).toLocaleString()} rows/s` : ""}</div>) : <div className="text-muted">Waiting for migration events…</div>}</div></Card></div>
       {merge.state === "merged" && !merge.contracted_at && <div className="flex items-center justify-between rounded-xl border border-red-400/30 bg-red-400/[.055] p-5"><div><div className="font-semibold text-red-200">Destructive zone</div><div className="mt-1 text-xs text-muted">Revert is lossless until contract permanently drops retained data.</div></div><div className="flex gap-3"><Button variant="outline" onClick={() => void onRevert()}>Revert merge</Button><Button variant="destructive" onClick={() => { if (confirm("Contract permanently drops retained columns. This cannot be undone. Continue?")) void onContract(); }}><Trash2 className="h-4 w-4" />Contract — permanently drop</Button></div></div>}

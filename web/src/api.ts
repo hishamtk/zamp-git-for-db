@@ -31,6 +31,16 @@ export type MergePreview = {
   plan: MigrationStep[];
   resultIR: SchemaIR;
 };
+export type CommitLogEntry = {
+  id: string;
+  parent_id: string | null;
+  message: string;
+  created_at: string;
+};
+export type RewindPreview = MergePreview & {
+  targetCommit: string;
+  undone: Array<{ id: string; message: string; created_at: string }>;
+};
 export type IntegrateResult = {
   source: string;
   target: string;
@@ -51,6 +61,7 @@ export type ValidateReport = {
   blocked: boolean;
 };
 export type MergeDetail = MergePreview & {
+  source_branch?: string;
   error?: string | null;
   contracted_at?: string | null;
   steps: Array<MigrationStep & {
@@ -133,6 +144,12 @@ export const api = {
     request<MergeDetail>(`/api/merges/${id}/revert`, { method: "POST" }),
   contractMerge: (id: number) =>
     request<MergeDetail>(`/api/merges/${id}/contract`, { method: "POST" }),
+  log: (branch: string) =>
+    request<CommitLogEntry[]>(`/api/branches/${encodeURIComponent(branch)}/log`),
+  previewRewind: (body: { commit: string } | { mergesBack: number }) =>
+    request<RewindPreview>("/api/rewinds", { method: "POST", body: JSON.stringify(body) }),
+  applyRewind: (id: number) =>
+    request<MergeDetail>(`/api/rewinds/${id}/apply`, { method: "POST" }),
   validate: (branch: string) =>
     request<ValidateReport>("/api/validate", {
       method: "POST",

@@ -28,23 +28,48 @@ describe("demo reset", () => {
     if (root && root.n < SEED_TABLES.length) expect(seedId).not.toBe(root.id);
   });
 
-  it("POST /api/demo/reset keeps seeded tables", async () => {
-    const before = await sql<{ relname: string }[]>`
-      SELECT c.relname FROM pg_class c
-        JOIN pg_namespace n ON n.oid = c.relnamespace
-       WHERE n.nspname = 'main' AND c.relkind = 'r'`;
-    const names = before.map((row) => row.relname).sort();
+  it("POST /api/demo/reset keeps seeded tables, drops extras, and clears merge history", async () => {
+    await sql.unsafe(`CREATE TABLE IF NOT EXISTS main.gitdb_reset_probe (id bigint PRIMARY KEY)`);
+    const [main] = await sql<{ head_commit: string }[]>`
+      SELECT head_commit FROM gitdb.branches WHERE name = 'main'`;
+    await sql`
+      INSERT INTO gitdb.merges (
+        source_branch, source_commit, target_commit, base_commit, plan, state
+      ) VALUES (
+        'reset-history', ${main!.head_commit}, ${main!.head_commit}, ${main!.head_commit},
+        '[]'::jsonb, 'merged'
+      )`;
+
     const res = await app.inject({ method: "POST", url: "/api/demo/reset" });
     expect(res.statusCode).toBe(200);
     const body = res.json();
     expect(body.state).toBe("reset");
+
     const after = await sql<{ relname: string }[]>`
       SELECT c.relname FROM pg_class c
         JOIN pg_namespace n ON n.oid = c.relnamespace
        WHERE n.nspname = 'main' AND c.relkind = 'r'`;
-    expect(after.map((row) => row.relname).sort()).toEqual(names);
-    const [main] = await sql<{ head_commit: string }[]>`
+    const names = after.map((row) => row.relname);
+    for (const table of SEED_TABLES) expect(names).toContain(table);
+    expect(names).not.toContain("gitdb_reset_probe");
+
+    const [head] = await sql<{ head_commit: string }[]>`
       SELECT head_commit FROM gitdb.branches WHERE name = 'main'`;
-    expect(main?.head_commit).toBe(body.commit);
+    expect(head?.head_commit).toBe(body.commit);
+
+    const [{ merges }] = await sql<{ merges: string }[]>`SELECT count(*)::text AS merges FROM gitdb.merges`;
+    expect(merges).toBe("0");
+    const extra = await sql<{ id: string }[]>`
+      SELECT id FROM gitdb.commits
+       WHERE branch = 'main'
+         AND id NOT IN (
+           WITH RECURSIVE keep AS (
+             SELECT id, parent_id FROM gitdb.commits WHERE id = ${body.commit}
+             UNION ALL
+             SELECT c.id, c.parent_id FROM gitdb.commits c JOIN keep k ON c.id = k.parent_id
+           )
+           SELECT id FROM keep
+         )`;
+    expect(extra).toEqual([]);
   });
 });

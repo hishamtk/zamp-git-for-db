@@ -7,9 +7,9 @@ import { canonicalizeTypeString } from "../ir/typecanon.js";
 import type { Constraint } from "../ir/types.js";
 import { mainIR, workingIR } from "../vcs/branches.js";
 
-/** Measured backfill throughput (BUILD.md). */
+/** Measured backfill throughput: 136 k rows/sec on the 20 M-row harness. */
 export const BACKFILL_ROWS_PER_SEC = 136_000;
-/** Typical exclusive-lock window after expand/cutover (BUILD.md). */
+/** Typical exclusive-lock window after expand/cutover. */
 export const LOCK_WINDOW_MS = 12;
 
 export type Finding = {

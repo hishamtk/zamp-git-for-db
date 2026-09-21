@@ -6,7 +6,7 @@ import type { FastifyInstance } from "fastify";
 const branch = "task18-route";
 let app: FastifyInstance;
 
-describe("Task 18 API routes", () => {
+describe("API routes", () => {
   beforeAll(async () => {
     app = await buildApp();
     await sql`DELETE FROM gitdb.merges WHERE source_branch = ${branch}`;

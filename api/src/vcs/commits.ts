@@ -122,12 +122,115 @@ export async function lowestCommonAncestor(sql: Sql, left: string, right: string
   return requireCommit(sql, id);
 }
 
+export class RewindError extends Error {
+  constructor(
+    message: string,
+    readonly status = 400,
+    readonly code = "rewind_error",
+  ) {
+    super(message);
+    this.name = "RewindError";
+  }
+}
+
+/** HEAD first, then each `parent_id`, stopping at root, a cycle, or `limit`. */
+export function walkAncestorIds(
+  parents: Map<string, string | null>,
+  head: string,
+  limit = Number.POSITIVE_INFINITY,
+): string[] {
+  const ids: string[] = [];
+  const seen = new Set<string>();
+  let id: string | null = head;
+  while (id && !seen.has(id) && ids.length < limit) {
+    seen.add(id);
+    ids.push(id);
+    if (!parents.has(id)) break;
+    id = parents.get(id) ?? null;
+  }
+  return ids;
+}
+
+export async function loadCommitParents(sql: Sql): Promise<Map<string, string | null>> {
+  const rows = await sql<{ id: string; parent_id: string | null }[]>`
+    SELECT id, parent_id FROM gitdb.commits`;
+  return new Map(rows.map((row) => [row.id, row.parent_id]));
+}
+
+function parseCommit(row: Commit): Commit {
+  return { ...row, ir: SchemaIRSchema.parse(row.ir) };
+}
+
+/** Reachable history from a head, newest first. */
+export async function ancestorsFrom(sql: Sql, head: string, limit = 50): Promise<Commit[]> {
+  const ids = walkAncestorIds(await loadCommitParents(sql), head, limit);
+  if (!ids.length) return [];
+  const rows = await sql<Commit[]>`SELECT * FROM gitdb.commits WHERE id IN ${sql(ids)}`;
+  const byId = new Map(rows.map((row) => [row.id, parseCommit(row)]));
+  return ids.map((id) => {
+    const commit = byId.get(id);
+    if (!commit) throw new Error(`missing commit ${id}`);
+    return commit;
+  });
+}
+
+export type RewindTarget = {
+  target: Commit;
+  /** Commits that will fall off HEAD, newest first (current HEAD … child of target). */
+  undone: Commit[];
+};
+
+/**
+ * Resolve a rewind destination on `main`'s parent chain.
+ * `mergesBack: 1` is HEAD's parent; `commit` must be a strict ancestor of `head`.
+ */
+export async function resolveRewindTarget(
+  sql: Sql,
+  head: string,
+  opts: { commit?: string; mergesBack?: number },
+): Promise<RewindTarget> {
+  const chain = await ancestorsFrom(sql, head, 500);
+  if (!chain.length) throw new RewindError("main has no commits", 500, "no_head");
+
+  let targetIndex: number;
+  if (opts.commit) {
+    targetIndex = chain.findIndex((commit) => commit.id === opts.commit);
+    if (targetIndex < 0) {
+      throw new RewindError(
+        `commit ${opts.commit} is not an ancestor of main HEAD`,
+        400,
+        "not_ancestor",
+      );
+    }
+  } else if (opts.mergesBack != null) {
+    if (!Number.isInteger(opts.mergesBack) || opts.mergesBack < 1) {
+      throw new RewindError("mergesBack must be a positive integer", 400, "invalid_merges_back");
+    }
+    targetIndex = opts.mergesBack;
+    if (targetIndex >= chain.length) {
+      throw new RewindError(
+        `cannot rewind ${opts.mergesBack} commits; main only has ${chain.length} reachable commits`,
+        400,
+        "past_root",
+      );
+    }
+  } else {
+    throw new RewindError("provide commit or mergesBack", 400, "invalid_request");
+  }
+
+  if (targetIndex === 0) {
+    throw new RewindError("main is already at this commit", 400, "already_at_head");
+  }
+
+  return { target: chain[targetIndex]!, undone: chain.slice(0, targetIndex) };
+}
+
 /** Newest-first commit list for a branch. */
 export async function log(sql: Sql, branch: string, limit = 50): Promise<Commit[]> {
   const rows = await sql<Commit[]>`
     SELECT * FROM gitdb.commits WHERE branch = ${branch}
      ORDER BY created_at DESC LIMIT ${limit}`;
-  return rows.map((r) => ({ ...r, ir: SchemaIRSchema.parse(r.ir) }));
+  return rows.map(parseCommit);
 }
 
 /** Tables created by `infra/seed.mjs`. Reset must never compile these as DROP TABLE. */

@@ -1,11 +1,12 @@
 import { sql as requestSql, workerSql, type Sql } from "../db.js";
+import type { SchemaOp } from "../diff/diff.js";
 import { hashIR } from "../ir/canonical.js";
-import { SchemaIRSchema } from "../ir/types.js";
+import { SchemaIRSchema, type SchemaIR } from "../ir/types.js";
 import { runBackfill, type BackfillProgress } from "./backfill.js";
 import { guardedDDLWithViews } from "./deps.js";
 import { guardedDDL, type EmitEvent } from "./guarded.js";
 import { createIndexConcurrently, type IndexAttemptEvent } from "./indexes.js";
-import type { MigrationStep } from "./plan.js";
+import { compilePlan, type MigrationStep } from "./plan.js";
 
 export type RunnerEvent = EmitEvent | BackfillProgress | IndexAttemptEvent;
 
@@ -22,6 +23,32 @@ type StepRow = {
   seq: number;
   state: "pending" | "running" | "done" | "failed" | "skipped";
 };
+
+/** Insert a planned merge and persist its compiled steps. */
+export async function insertPlannedMerge(
+  sql: Sql,
+  opts: {
+    sourceBranch: string;
+    sourceCommit: string;
+    targetCommit: string;
+    baseCommit: string;
+    resultIR: SchemaIR;
+    fromIR: SchemaIR;
+    ops: SchemaOp[];
+  },
+): Promise<{ id: number; plan: MigrationStep[] }> {
+  const [row] = await sql<{ id: string }[]>`
+    INSERT INTO gitdb.merges (
+      source_branch, source_commit, target_commit, base_commit, result_ir, plan, state
+    ) VALUES (
+      ${opts.sourceBranch}, ${opts.sourceCommit}, ${opts.targetCommit}, ${opts.baseCommit},
+      ${sql.json(opts.resultIR as never)}, '[]'::jsonb, 'planned'
+    ) RETURNING id::text`;
+  const id = Number(row!.id);
+  const plan = compilePlan(opts.ops, { mergeId: id, from: opts.fromIR });
+  await persistPlan(sql, id, plan);
+  return { id, plan };
+}
 
 /** Persist a compiled plan without resetting progress from an earlier run. */
 export async function persistPlan(sql: Sql, mergeId: number, plan: MigrationStep[]): Promise<void> {

@@ -117,9 +117,7 @@ sudo systemctl mask sleep.target suspend.target hibernate.target hybrid-sleep.ta
   data is gone. Revert is lossless until then.
 - Branch constraints/indexes are *declared* and validated against real rows;
   they are enforced on merge, not inside the branch.
-- SQL authoring is the Task 18 DDL whitelist, not every PostgreSQL feature.
-- Demo video is not recorded yet. The lock chart and the test suite are the
-  durable evidence until it is.
+- SQL authoring is the DDL whitelist (add/drop/rename/retype columns, constraints,
+  indexes, create/drop tables), not every PostgreSQL feature.
 
-See `decisions.md` for the why, `PLAN.md` for the measured hypotheses, and
-`BUILD.md` for the executable spec.
+See `decisions.md` for what was chosen, rejected, and cut.

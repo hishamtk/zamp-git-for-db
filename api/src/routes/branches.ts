@@ -15,7 +15,7 @@ import {
   requireBranch,
   workingIR,
 } from "../vcs/branches.js";
-import { log, lowestCommonAncestor, requireCommit, writeCommit } from "../vcs/commits.js";
+import { ancestorsFrom, log, lowestCommonAncestor, requireCommit, writeCommit } from "../vcs/commits.js";
 import { merge } from "../vcs/merge.js";
 
 const branchBody = z.object({
@@ -142,8 +142,9 @@ export async function branchRoutes(app: FastifyInstance): Promise<void> {
 
   app.get("/api/branches/:name/log", async (request) => {
     const branch = branchParam(request);
-    await requireBranch(sql, branch);
-    return log(sql, branch);
+    const b = await requireBranch(sql, branch);
+    if (!b.head_commit) return [];
+    return branch === MAIN_BRANCH ? ancestorsFrom(sql, b.head_commit) : log(sql, branch);
   });
 
   app.post("/api/branches/:name/integrate", async (request, reply) => {

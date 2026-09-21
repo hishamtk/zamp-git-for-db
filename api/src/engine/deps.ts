@@ -105,13 +105,19 @@ export async function guardedDDLWithViews(
 
   const branchIRs = new Map<string, SchemaIR>();
   for (const branch of branches) {
+    const [ns] = await sql<{ nspname: string }[]>`
+      SELECT nspname FROM pg_namespace WHERE nspname = ${branch.schema_name}`;
+    if (!ns) continue;
     const ir = (await introspect(sql, branch.schema_name)).ir;
     branchIRs.set(branch.schema_name, cloneIR(ir));
   }
 
   await guardedDDL(sql, opts.ddl, opts.emit, undefined, async (tx) => {
     for (const dep of deps) {
-      await tx.unsafe(`DROP VIEW ${qname(dep.schema_name, dep.view_name)}`);
+      const [ns] = await tx<{ nspname: string }[]>`
+        SELECT nspname FROM pg_namespace WHERE nspname = ${dep.schema_name}`;
+      if (!ns) continue;
+      await tx.unsafe(`DROP VIEW IF EXISTS ${qname(dep.schema_name, dep.view_name)}`);
     }
 
     await tx.unsafe(opts.ddl);
@@ -120,8 +126,12 @@ export async function guardedDDLWithViews(
     const newParentTable = findTable(newParentIR, opts.table);
 
     for (const dep of [...deps].sort((a, b) => a.depth - b.depth)) {
+      const [ns] = await tx<{ nspname: string }[]>`
+        SELECT nspname FROM pg_namespace WHERE nspname = ${dep.schema_name}`;
+      if (!ns) continue;
       const branch = bySchema.get(dep.schema_name)!;
-      const branchIR = branchIRs.get(dep.schema_name)!;
+      const branchIR = branchIRs.get(dep.schema_name);
+      if (!branchIR) continue;
       const branchTable = findTable(branchIR, dep.view_name);
       const oldTable = findTable(oldParent, dep.view_name);
       const newTable = findTable(newParentIR, dep.view_name);

@@ -81,7 +81,6 @@ export async function createBranch(
 
   const from = opts.from ?? MAIN_BRANCH;
   if (from !== MAIN_BRANCH) {
-    // Branch-of-a-branch would need an ancestor walk for merges; PLAN.md cuts it.
     throw new BranchError("branches can only be created from 'main'", 400, "unsupported_parent");
   }
 

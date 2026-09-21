@@ -5,14 +5,28 @@ A running log of the real calls made building this. Each entry records **the dec
 **what was deliberately cut**.
 
 Entries 1–15 were made during design and are each backed by a measurement, not an opinion.
-Entries are appended as implementation proceeds.
+Entries 16–21 are product and deployment calls. Entries 22–27 were made once the merge
+engine existed and the remaining hard edges showed up in the demo: rewind, branch-to-branch
+integrate, leftover expand columns, and resetting a 25 M-row catalog.
+
+### How I framed the problem
+
+The brief is “version control for database schemas” against a real ~5 GB Postgres. I read
+that as: **branch the live catalog, change it, and merge without freezing the application**.
+Not a dump-and-diff registry, not Flyway scripts, not Dolt. The hard part is not generating
+`ALTER TABLE` — it is applying `REWRITE` changes to 25 million rows while readers keep
+running, and undoing a merge without inventing a second migration engine.
+
+That framing decides almost everything below: views instead of copies, catalog IR instead
+of text, expand-and-contract instead of in-place rewrites, contract as a separate
+destructive action, rewind as one forward plan rather than N reverse replays.
 
 ### How the numbers were produced
 
 Before writing product code, I stood up Postgres 17 in Docker and built a real 20 M-row /
-4 GB transactions table to test the core hypotheses. Every number below came from that
-harness (20-core machine, NVMe, `shared_buffers=2GB`). `infra/seed.mjs` reproduces the
-dataset; the probes are in `test/probes/`. Where a claim has no number, I say so.
+4 GB transactions table to test the core hypotheses. Every number in entries 1–15 came from
+that harness (20-core machine, NVMe, `shared_buffers=2GB`). `infra/seed.mjs` reproduces the
+dataset; the lock proof is `infra/proof.mjs`. Where a claim has no number, I say so.
 
 ---
 
@@ -124,14 +138,15 @@ answer. Diffing declared states does have one.
 
 It also makes rewinding cheap. Because commits are snapshots rather than deltas, going back five
 commits is a single `diff(HEAD_ir, commit_N_ir)` compiled into one forward migration — not five
-reverse replays.
+reverse replays. That is now the rewind path (entry 23).
 
 Content addressing gives commit deduplication and a Merkle history for free.
 
-**Cut.** A full commit DAG with lowest-common-ancestor traversal. Each branch stores
-`base_commit` at creation, so a three-way merge is an O(1) lookup that still catches the
-interesting case — main moved while you were branched. LCA only matters for branch-of-a-branch,
-which is cut.
+**Cut.** A full commit DAG with lowest-common-ancestor traversal *for merges into main*.
+Each branch stores `base_commit` at creation, so a three-way merge onto `main` is an O(1)
+lookup that still catches the interesting case — main moved while you were branched.
+Branch-of-a-branch was cut as a parent for `CREATE BRANCH`. LCA came back later, only for
+branch-to-branch integrate (entry 22).
 
 ## 6. Expand-and-contract — forced on us, and correct anyway
 
@@ -239,7 +254,9 @@ meaning the archive copy needs no sync trigger, unlike the forward backfill. Two
 buildable later: `physicalName` on every IR column, and `merges.contracted_at`. Both cost
 minutes now and are genuinely painful to retrofit, since by then the history is lost.
 
-**Cut.** Both tiers above the window, for this iteration.
+**Cut.** Both tiers above the window, for this iteration. Rewind (entry 23) is not a
+substitute for archive-on-contract: it restores schema, and reconstructible values, not
+bytes that contract already dropped.
 
 ## 11. Renames are ambiguous, so we ask
 
@@ -435,10 +452,13 @@ engineer would plausibly want next but which add surface area rather than depth.
 
 - **Row-level data diff and merge.** The brief versions *schemas*. Versioning data is a different product (entry 10).
 - **Row-level time travel.** Rejected on principle — write amplification on the hot path (entry 10).
+- **Archive-on-contract.** Designed (entry 10), not shipped. After contract, dropped-column bytes stay gone unless they can be recomputed from columns that remain.
+- **Creating a branch from a branch.** `CREATE BRANCH` is from `main` only. Feature branches can still integrate into each other (entry 22).
 - **Authentication, multi-tenancy, multiple target databases.** No bearing on the hard part.
 - **Non-Postgres engines.** The whole design leans on logical schemas, `NOT VALID` constraints and cheap `ADD COLUMN`. MySQL would need a different architecture, not a driver swap.
 - **Exotic schema objects** — procedures, triggers-as-schema, partitions, materialised views. Rejected loudly at introspection rather than silently mishandled.
-- **Full commit DAG with LCA** (entry 5).
+- **Bring-your-own Postgres.** The tool ships the instance it migrates (entry 18).
+- **Form-based schema editing.** Users write DDL (entry 17).
 
 ## 21. Where this design ends
 
@@ -456,3 +476,140 @@ regeneration.
 
 **Across regions**, `lock_timeout` retries interact badly with replication lag, and cutover would
 need to be coordinated rather than a single local transaction.
+
+**On this demo catalog**, rewind and reset must not “heal” `txns` with a 25 M-row rewrite
+(entries 24 and 27). That is a product bound, not a Postgres bound.
+
+---
+
+## 22. Branch-to-branch integrate walks ancestors; merge to `main` does not
+
+**Decision.** `CREATE BRANCH` still parents only from `main`. Copying a committed schema
+onto another *feature* branch (`POST /api/branches/:name/integrate`) does a lowest-common-ancestor
+three-way merge of IRs, rewrites the target’s views, and never runs the physical expander.
+
+**Alternatives.** Keep the entry-5 cut and refuse branch-to-branch work. Allow `CREATE BRANCH`
+from a branch, which needs the same walk plus a defined merge-to-main story for nested
+parents. Merge feature branches onto `main` through the same integrate path.
+
+**Reasoning.** Two people branching from `main` and wanting each other’s schema is the
+common case; nested branch creation is not. Integrate is schema-only — no rows are copied,
+no lock is taken on `main`, contract never runs — so it cannot accidentally migrate
+production. Merge-to-`main` stays the one path that may backfill 25 million rows.
+
+`base_commit` remains the O(1) merge base for `main`. LCA is used only when both sides
+have moved off that original parent.
+
+**Cut.** Branch-of-a-branch as a `CREATE BRANCH` parent. Automatic rebase of stale branches
+(entry 12) still stands.
+
+## 23. Rewind is one forward plan, not N reverse migrations
+
+**Decision.** Moving `main` back N merge commits is `diff(HEAD_ir, ancestor_ir)` compiled
+through the same expand → sync → backfill → cutover runner as a forward merge. It is not
+WAL replay, and it is not “run each merge’s plan backwards.”
+
+**Alternatives.** Parse Postgres WAL / a logical decoding stream and undo tuples. Store a
+reverse plan next to every merge and replay those in order. `pg_dump` the ancestor and
+restore it.
+
+**Reasoning.** Entry 5 already paid for this: commits are snapshots, so five steps back is
+one structural diff, not five inverse scripts. WAL undo would reconstruct row history this
+tool has explicitly refused to version (entry 10), and a 5 GB restore is the opposite of
+online. A stored reverse plan goes stale the moment contract drops a column or a later
+merge retypes the same path.
+
+The trade-off accepted: rewind restores **schema**, plus values that can still be computed
+from columns that remain. After contract, dropped-column bytes are gone. That is the same
+honesty as entry 9, applied backwards.
+
+**Cut.** Point-in-time row restore. Binlog/WAL-based rewind. Auto-running `drop_table` /
+`drop_column` for user objects — those stay manual contract steps, as on a forward merge.
+
+## 24. Rewind diffs committed HEAD, not the live catalog
+
+**Decision.** The rewind plan is `diff(head_commit.ir, ancestor.ir)`. Leftover expand
+columns (`col__old_<mergeId>`, `col__new`) are dropped as ordinary DDL at the end of
+the plan. Unrelated catalog drift — a `txns` retype that never made it into a commit — is
+ignored.
+
+**Alternatives.** `diff(introspect(main), ancestor.ir)`, which is what a “make the disk
+match the snapshot” tool would do. Sweep *every* extra live column, shadow or not.
+
+**Reasoning.** This was not theoretical. Rewinding an accounts-only retype against the live
+catalog compiled a **25 million-row `txns` backfill** because `txns.amount_cents` was still
+`numeric(20,2)` from an earlier unfinished rewrite while every commit IR said `bigint`.
+The commits being undone touched `accounts.name`. The plan tried to rewrite the credibility
+table.
+
+Committed IR vs committed IR answers “undo these commits.” Shadow leftovers are not in any
+commit IR — cutover hides them as `physicalName` — so they are appended as executable
+`DROP COLUMN` rather than as manual contract. That is the one place rewind *is* allowed to
+destroy expand debris: those columns are the migration engine’s, not the user’s schema.
+
+**Cut.** Using rewind as a catalog healer. If live `txns` has drifted from the seed IR,
+demo reset (entry 27) also refuses to spend minutes rewriting it.
+
+## 25. Revert, rewind, and contract are three undos, not one button
+
+**Decision.** Until contract, **Revert merge** swaps the retained `__old_*` column back —
+lossless, and the right control on the live merge screen. **Rewind** moves `main`’s HEAD
+to an ancestor and compiles one schema plan; it will drop leftover shadows. **Contract**
+permanently drops retained storage and closes the revert window.
+
+**Alternatives.** One “undo” that always rewinds. Auto-revert when the user picks an
+ancestor. Hide contract behind rewind.
+
+**Reasoning.** They are not the same operation. Revert does not change commit history;
+rewind does. Revert needs the backup column to still exist; rewind does not, and cannot
+resurrect contracted bytes. The UI already had a destructive zone for contract. Adding
+“Rewind here” on main history without explaining the difference produced the leftover
+`name__old_*` column: rewind had done `ALTER TYPE` in place and left the expand backup
+sitting beside `name`.
+
+**Cut.** Silently calling `revertMerge` from rewind when a backup happens to exist. The
+plan would then depend on leftover physical names that are not in the commit IR. Rewind
+stays a function of commits; revert stays a function of one merge job.
+
+## 26. One advisory lock serialises every physical migration
+
+**Decision.** Merges and rewinds share a single Postgres advisory lock (`MERGE_LOCK`). A
+second apply returns `409 { state: "merge_in_progress" }`. The backfill runs on a dedicated
+one-connection worker so it cannot starve the request pool.
+
+**Alternatives.** Allow concurrent table-disjoint migrations. Queue in the API process.
+No lock, rely on `lock_timeout` alone.
+
+**Reasoning.** Two expand/cutover pipelines on the same database interleave shadow columns,
+sync triggers, and view drops. `lock_timeout` protects *readers* from a queued `ALTER`; it
+does not protect two writers from each other. The API pool cannot donate a connection for
+a 3-minute backfill without stalling health checks and telemetry.
+
+The trade-off accepted: reviewers cannot run two demos at once. Demo reset (entry 27) is
+how a second person gets a clean `main`, not a second merge slot.
+
+**Cut.** Per-table locks, a migration queue UI, and killing competing backends (entry 2).
+
+## 27. Demo reset restores the seed snapshot; it does not migrate `txns`
+
+**Decision.** `POST /api/demo/reset` deletes feature branches, fails any running merge,
+points `main` at the seeded catalog commit, prunes unreachable commits and all merge jobs,
+and drops extra tables plus `__new` / `__old_*` leftovers. It does **not** compile
+`diff(live, seed)` through the merge engine.
+
+**Alternatives.** Reset = rewind to seed, including a `txns` retype if live drifted.
+`DROP SCHEMA main CASCADE` and re-seed (~100 s and a destroyed demo). Truncate user tables
+and keep history.
+
+**Reasoning.** Reviewers share one bundled database (entry 18). Reset has to be fast and
+safe to click twice. Running the engine to “make live match seed” hung the first
+implementation on `retype_column txns` (~25 M rows) while merge history stayed on screen —
+the button appeared to do nothing. Prune + sweep is tens of milliseconds; the seeded 5 GB
+of rows stays, because this versions schemas, not a factory-reset of data.
+
+The seed commit is the fullest snapshot (`accounts`, `cards`, `disputes`, `merchants`,
+`txns`), not the oldest root. An early two-table commit must never become the reset
+target, or reset itself compiles `DROP TABLE` for the extra seed tables.
+
+**Cut.** Using reset as a data wipe. Using reset as a 25 M-row healer. Auth-gated
+per-reviewer databases (entry 16).

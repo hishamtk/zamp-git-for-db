@@ -1,9 +1,11 @@
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { sql, workerSql } from "../db.js";
+import { dropMigrationLeftovers } from "../engine/demo.js";
 import { contractMerge, revertMerge } from "../engine/contract.js";
 import { compilePlan } from "../engine/plan.js";
 import { persistPlan, runMerge } from "../engine/runner.js";
+import { assertBranchesAllowRewind, regenerateFeatureBranches } from "../engine/rewind.js";
 import { applySchemaOps } from "../ir/parse.js";
 import { subscribeMerge, emitMergeEvent } from "../telemetry.js";
 import { isDirty, requireBranch } from "../vcs/branches.js";
@@ -35,6 +37,94 @@ async function waitForActiveMerge(): Promise<number | null> {
 
 function conflict(state: string, extra: Record<string, unknown> = {}): Error {
   return Object.assign(new Error(state), { statusCode: 409, payload: { state, ...extra } });
+}
+
+/** Rewind drops expand backups; those merges can no longer be reverted. */
+async function closeMergesForDroppedBackups(): Promise<void> {
+  await sql`
+    UPDATE gitdb.merges
+       SET state = 'reverted',
+           finished_at = coalesce(finished_at, now()),
+           error = 'expand backup dropped by rewind'
+     WHERE state = 'merged'
+       AND contracted_at IS NULL
+       AND source_branch <> 'rewind'
+       AND EXISTS (
+         SELECT 1 FROM jsonb_array_elements(plan) AS step
+          WHERE coalesce(step->>'backup', '') <> ''
+            AND NOT EXISTS (
+              SELECT 1
+                FROM pg_attribute a
+                JOIN pg_class c ON c.oid = a.attrelid
+                JOIN pg_namespace n ON n.oid = c.relnamespace
+               WHERE n.nspname = 'main'
+                 AND c.relkind = 'r'
+                 AND c.relname = step->>'table'
+                 AND a.attname = step->>'backup'
+                 AND a.attnum > 0
+                 AND NOT a.attisdropped
+            )
+       )`;
+}
+
+export async function getMerge(id: number): Promise<Record<string, unknown>> {
+  const [merge] = await sql<Record<string, unknown>[]>`
+    SELECT id::text, source_branch, source_commit, target_commit, base_commit,
+           result_ir, plan, state, error, started_at, finished_at, contracted_at, created_at
+      FROM gitdb.merges WHERE id = ${id}`;
+  if (!merge) throw Object.assign(new Error(`no such merge: ${id}`), { statusCode: 404 });
+  const steps = await sql`
+    SELECT seq, kind, sql, state, rows_done, rows_total, cursor, lock_attempts, ms, error
+      FROM gitdb.merge_steps WHERE merge_id = ${id} ORDER BY seq`;
+  return { ...merge, id, steps };
+}
+
+/** Claim the merge advisory lock, run persisted steps, and regenerate branches after a rewind. */
+export async function applyMergeJob(id: number): Promise<Record<string, unknown>> {
+  const [job] = await sql<{ source_branch: string }[]>`
+    SELECT source_branch FROM gitdb.merges WHERE id = ${id}`;
+  if (!job) throw Object.assign(new Error(`no such merge: ${id}`), { statusCode: 404 });
+  if (job.source_branch === "rewind") await assertBranchesAllowRewind(sql);
+
+  const claimed = await sql.begin(async (tx) => {
+    const [lock] = await tx<{ locked: boolean }[]>`SELECT pg_try_advisory_xact_lock(${MERGE_LOCK}) AS locked`;
+    if (!lock?.locked) return false;
+    const running = await activeMerge();
+    if (running != null && running !== id) throw conflict("merge_in_progress", { mergeId: running });
+    const rows = await tx`
+      UPDATE gitdb.merges SET state = 'running', started_at = coalesce(started_at, now()), error = NULL
+       WHERE id = ${id} AND state IN ('planned', 'failed')
+       RETURNING id`;
+    if (!rows.length) {
+      const [existing] = await tx<{ state: string }[]>`SELECT state FROM gitdb.merges WHERE id = ${id}`;
+      if (!existing) throw Object.assign(new Error(`no such merge: ${id}`), { statusCode: 404 });
+      throw conflict(existing.state);
+    }
+    return true;
+  });
+  if (!claimed) {
+    const running = await waitForActiveMerge();
+    throw conflict("merge_in_progress", { mergeId: running });
+  }
+
+  await workerSql`SELECT pg_advisory_lock(${MERGE_LOCK})`;
+  try {
+    await emitMergeEvent(sql, id, { type: "merge_started", mergeId: id });
+    await runMerge(id, {
+      sql,
+      worker: workerSql,
+      emit: (event) => { void emitMergeEvent(sql, id, event as unknown as Record<string, unknown>); },
+    });
+    if (job.source_branch === "rewind") {
+      await dropMigrationLeftovers(sql);
+      await closeMergesForDroppedBackups();
+      await regenerateFeatureBranches(sql);
+    }
+    await emitMergeEvent(sql, id, { type: "merge_finished", mergeId: id });
+  } finally {
+    await workerSql`SELECT pg_advisory_unlock(${MERGE_LOCK})`;
+  }
+  return getMerge(id);
 }
 
 export async function mergeRoutes(app: FastifyInstance): Promise<void> {
@@ -72,43 +162,7 @@ export async function mergeRoutes(app: FastifyInstance): Promise<void> {
     return reply.code(201).send({ id, state: "planned", ops: result.ops, plan, resultIR });
   });
 
-  app.post("/api/merges/:id/apply", async (request) => {
-    const id = mergeId(request);
-    const claimed = await sql.begin(async (tx) => {
-      const [lock] = await tx<{ locked: boolean }[]>`SELECT pg_try_advisory_xact_lock(${MERGE_LOCK}) AS locked`;
-      if (!lock?.locked) return false;
-      const running = await activeMerge();
-      if (running != null && running !== id) throw conflict("merge_in_progress", { mergeId: running });
-      const rows = await tx`
-        UPDATE gitdb.merges SET state = 'running', started_at = coalesce(started_at, now()), error = NULL
-         WHERE id = ${id} AND state IN ('planned', 'failed')
-         RETURNING id`;
-      if (!rows.length) {
-        const [existing] = await tx<{ state: string }[]>`SELECT state FROM gitdb.merges WHERE id = ${id}`;
-        if (!existing) throw Object.assign(new Error(`no such merge: ${id}`), { statusCode: 404 });
-        throw conflict(existing.state);
-      }
-      return true;
-    });
-    if (!claimed) {
-      const running = await waitForActiveMerge();
-      throw conflict("merge_in_progress", { mergeId: running });
-    }
-
-    await workerSql`SELECT pg_advisory_lock(${MERGE_LOCK})`;
-    try {
-      await emitMergeEvent(sql, id, { type: "merge_started", mergeId: id });
-      await runMerge(id, {
-        sql,
-        worker: workerSql,
-        emit: (event) => { void emitMergeEvent(sql, id, event as unknown as Record<string, unknown>); },
-      });
-      await emitMergeEvent(sql, id, { type: "merge_finished", mergeId: id });
-    } finally {
-      await workerSql`SELECT pg_advisory_unlock(${MERGE_LOCK})`;
-    }
-    return getMerge(id);
-  });
+  app.post("/api/merges/:id/apply", async (request) => applyMergeJob(mergeId(request)));
 
   app.post("/api/merges/:id/revert", async (request) => {
     const id = mergeId(request);
@@ -134,16 +188,4 @@ export async function mergeRoutes(app: FastifyInstance): Promise<void> {
     const unsubscribe = subscribeMerge(id, (event) => socket.send(JSON.stringify(event)));
     socket.on("close", unsubscribe);
   });
-}
-
-async function getMerge(id: number): Promise<Record<string, unknown>> {
-  const [merge] = await sql<Record<string, unknown>[]>`
-    SELECT id::text, source_branch, source_commit, target_commit, base_commit,
-           result_ir, plan, state, error, started_at, finished_at, contracted_at, created_at
-      FROM gitdb.merges WHERE id = ${id}`;
-  if (!merge) throw Object.assign(new Error(`no such merge: ${id}`), { statusCode: 404 });
-  const steps = await sql`
-    SELECT seq, kind, sql, state, rows_done, rows_total, cursor, lock_attempts, ms, error
-      FROM gitdb.merge_steps WHERE merge_id = ${id} ORDER BY seq`;
-  return { ...merge, id, steps };
 }

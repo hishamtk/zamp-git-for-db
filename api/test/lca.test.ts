@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { lowestCommonAncestorId } from "../src/vcs/commits.js";
+import { lowestCommonAncestorId, walkAncestorIds } from "../src/vcs/commits.js";
 
 function chain(pairs: Array<[string, string | null]>): Map<string, string | null> {
   return new Map(pairs);
@@ -39,5 +39,23 @@ describe("lowestCommonAncestorId", () => {
       ["b", null],
     ]);
     expect(lowestCommonAncestorId(parents, "a", "b")).toBeNull();
+  });
+});
+
+describe("walkAncestorIds", () => {
+  it("returns HEAD first then parents toward root", () => {
+    const parents = chain([
+      ["c0", null],
+      ["c1", "c0"],
+      ["c2", "c1"],
+    ]);
+    expect(walkAncestorIds(parents, "c2")).toEqual(["c2", "c1", "c0"]);
+    expect(walkAncestorIds(parents, "c2", 2)).toEqual(["c2", "c1"]);
+  });
+
+  it("stops on a cycle and on a missing parent pointer", () => {
+    const cyclic = chain([["a", "b"], ["b", "a"]]);
+    expect(walkAncestorIds(cyclic, "a")).toEqual(["a", "b"]);
+    expect(walkAncestorIds(new Map(), "orphan")).toEqual(["orphan"]);
   });
 });
